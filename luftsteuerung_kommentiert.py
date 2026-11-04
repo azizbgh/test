@@ -69,6 +69,10 @@ MIN_OUTPUT_A = 0.0
 MAX_OUTPUT_A = 0.020              # NI-9266: 0–20 mA
 SENSOR_ZERO_A = 0.004            # Sensor-Bezugspunkt: 4 mA
 SENSOR_MAX_A = 0.020             # Erwartetes oberes Sensorsignal
+# Toleranz ausschließlich für die Plausibilitätsprüfung realer Messwerte.
+# Die physikalische Umrechnung behält 4,000 mA als Durchfluss-Nullpunkt.
+SENSOR_VALID_MIN_A = 0.0039       # 3,9 mA: untere akzeptierte Messtoleranz
+SENSOR_VALID_MAX_A = 0.0201       # 20,1 mA: obere akzeptierte Messtoleranz
 
 # Dimensionsprüfung: (A - A) / (A je m³/h) ergibt m³/h.
 # Sensorfaktoren dürfen keine Aktuatorkennlinie allein aufgrund gleicher Einheit ersetzen.
@@ -485,7 +489,7 @@ class SensorReading:
     def valid(self) -> bool:
         return (self.problem is None and self.current_a is not None
                 and math.isfinite(self.current_a)
-                and SENSOR_ZERO_A <= self.current_a <= SENSOR_MAX_A)
+                and SENSOR_VALID_MIN_A <= self.current_a <= SENSOR_VALID_MAX_A)
 
     def recent(self, now: float) -> bool:
         # Frische wird auch für unplausible Rohwerte bestimmt. 0 mA ist nicht
@@ -505,8 +509,8 @@ def evaluate_sensor_currents(currents, received_at: float) -> dict[str, SensorRe
             problem = "Keine neuen Samples · Messwert fehlt"
         elif not math.isfinite(current):
             problem = "Ungültiger Zahlenwert im Sensorsignal"
-        elif not SENSOR_ZERO_A <= current <= SENSOR_MAX_A:
-            problem = "Sensorsignal außerhalb 4–20 mA"
+        elif not SENSOR_VALID_MIN_A <= current <= SENSOR_VALID_MAX_A:
+            problem = "Sensorsignal außerhalb 3,9–20,1 mA"
         else:
             problem = None
         readings[name] = SensorReading(current, received_at, problem)
@@ -943,7 +947,8 @@ class LuftsteuerungApp(ctk.CTk):
         self._label(card,
             "Messung: NI-9253 · ±20 mA konfiguriert · 1.000 Samples/s je Kanal\n"
             "Ausgabe: NI-9266 · 0–20 mA konfiguriert · FU-Skalierung 4–20 mA\n"
-            "Sensor-Plausibilitätsbereich: 4–20 mA · Anzeige alle 200 ms · veraltet nach 1 s\n\n"
+            "Sensor-Nennbereich: 4–20 mA · akzeptierte Messtoleranz: 3,9–20,1 mA\n"
+            "Anzeige alle 200 ms · veraltet nach 1 s\n\n"
             "GLF/GHF-Stellglieder: bestätigt linear 0–100 % = 0–20 mA.\n"
             "Sensor-Durchflussformeln bleiben davon vollständig getrennt.\n\n"
             "Kein automatischer Wiederanlauf, kein Fehler-Reset, keine Abschaltstrom-Ausgabe.",
@@ -1037,8 +1042,8 @@ class LuftsteuerungApp(ctk.CTk):
                 # Endliche Rohströme einschließlich 0,000 mA unverändert zeigen.
                 # NaN/Inf ausdrücklich als ungültig kennzeichnen, niemals als 0.
                 if math.isfinite(reading.current_a):
-                    # Bei einem Bereichsfehler mehr Stellen zeigen: 3,9999 mA
-                    # darf nicht auf scheinbar zulässige 4,000 mA gerundet werden.
+                    # Bei einem Bereichsfehler mehr Stellen zeigen: 3,8999 mA
+                    # darf nicht auf scheinbar zulässige 3,900 mA gerundet werden.
                     raw_text = number_de(reading.current_a * 1000, 3 if reading.valid else 6)
                 else:
                     raw_text = ("NaN" if math.isnan(reading.current_a) else
