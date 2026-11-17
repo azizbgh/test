@@ -9,6 +9,28 @@ Entpacken und mit Python starten:
 python luftsteuerung_testversion.py
 ```
 
+## Testversion 2: Korrektur der gemeinsamen Regelung
+
+Die Nachführung berücksichtigt jetzt die Stellgrenzen des GLF-Ventils und
+den noch offenen Gesamtfehler. Die vorherige Version konnte die GHF-Grundlast
+zu früh festhalten, obwohl GLF bereits vollständig geöffnet war. Besonders
+bei 300 m³/h blieb dadurch im Testmodell eine erhebliche Abweichung stehen.
+Das GLF-Arbeitsband 40–60 m³/h hat gegenüber fehlender Stellreserve keinen
+Vorrang mehr. PID-Parameter, Messwertanzeige und Toleranz wurden nicht geändert.
+
+Fenstertitel und Einstellungen zeigen **Testversion 2**. Der Regelstatus
+unterscheidet jetzt ausdrücklich zwischen innerhalb und außerhalb von ±20 m³/h;
+alte oder ungültige Rückmeldungen werden nicht als erreicht markiert.
+Für die neue Datei das alte Programmfenster schließen, das ZIP erneut entpacken
+und die daraus entnommene Python-Datei starten.
+
+Im unveränderten synthetischen Modell mit 50-ms-Schritten liegt der Istwert
+bei Sollwert 300 nach 30 s Modellzeit bei 293,304 und nach 60 s bei
+303,613 m³/h. Ab etwa 16 s bleibt dieser Test innerhalb ±20 m³/h.
+Zusätzlich werden mehrere Sollwerte von 92 bis 549, schwankende Zeitschritte,
+kleine Sollwertänderungen und große Sollwertwechsel geprüft. Das ist kein
+Nachweis für das Verhalten der realen Anlage.
+
 Für die Simulation werden keine zusätzlichen Python-Pakete benötigt; eine
 Python-Installation mit Tkinter genügt. Die Oberfläche enthält **Steuerung,
 Regelung und Einstellungen**, Messwertalter in Millisekunden und Diagramme.

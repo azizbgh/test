@@ -379,14 +379,35 @@ class AirflowRegulator:
             elif cfg.mode == "GHF":
                 self._commands["GLF"] = 0.
             if cfg.mode == "BOTH":
-                direction = 1 if cfg.target - self.base > 100. else -1 if cfg.target - self.base < 10. else 0
+                lower = max(50., cfg.target - 100.)
+                upper = min(449., cfg.target - 10.)
+                error = cfg.target - flows["GHF"] - flows["GLF"]
+                l_position = self._commands["GLF"]
+                g_position = self._commands["GHF"]
+                # Zuerst fehlende Stellreserve behandeln. Eine kleine GLF-Menge
+                # bedeutet bei bereits ganz geöffnetem GLF nicht, dass GHF
+                # weiter geschlossen werden dürfte: Das würde den Gesamtfehler
+                # vergrößern. Antiwindup allein kann diese Fehlverteilung nicht lösen.
+                direction = 1 if self.base < lower else -1 if self.base > upper else 0
                 immediate = direction != 0
                 if not direction:
-                    direction = 1 if flows["GLF"] > cfg.preferred_high else -1 if flows["GLF"] < cfg.preferred_low else 0
+                    if l_position >= 98. and error > .2:
+                        direction = 1
+                    elif l_position <= 22. and error < -.2:
+                        direction = -1
+                    elif flows["GLF"] > cfg.preferred_high and l_position > 22. and g_position < 98.:
+                        direction = 1
+                    elif flows["GLF"] < cfg.preferred_low and l_position < 98. and g_position > 22.:
+                        direction = -1
+                # Innerhalb des zulässigen Bereichs kein Hinauslaufen zulassen.
+                # Bei großem Sollsprung kann die bisherige Basis außerhalb der
+                # NEUEN Grenzen liegen: dorthin rampen, nicht schlagartig springen.
+                if (direction > 0 and self.base >= upper) or (direction < 0 and self.base <= lower):
+                    direction = 0
                 if direction != self._direction:
                     self._direction, self._direction_since = direction, now if direction else None
                 if direction and (immediate or now - self._direction_since >= cfg.rebalance_delay_s):
-                    self.base = _clip(self.base + direction * cfg.base_rate_m3h_s * dt, 50., 449.)
+                    self.base = _clip(self.base + direction * cfg.base_rate_m3h_s * dt, min(lower, self.base), max(upper, self.base))
                     self._fu_goal = self._simulation_feedforward(cfg)
             self._commands["FU"] += _clip(self._fu_goal - self._commands["FU"], -cfg.fu_rate_percent_s * dt, cfg.fu_rate_percent_s * dt)
             # Eingangsnormalisierung ausdrücklich getrennt von der Messkennlinie:
@@ -426,7 +447,7 @@ from collections import deque
 DEVICE = "cDAQ9183-251EC5D"
 AI_CHANNELS = {"GHF": DEVICE + "Mod2/ai0", "GLF": DEVICE + "Mod2/ai1"}
 AO_LABELS = {"FU": DEVICE + "Mod1/ao0", "GLF": DEVICE + "Mod1/ao1", "GHF": DEVICE + "Mod1/ao2"}
-TEST_BUILD = "2026-11-17 / Testversion 1"
+TEST_BUILD = "2026-11-17 / Testversion 2"
 
 
 def _command_ma(name, percent):
@@ -817,7 +838,7 @@ class AirflowApp:
         self._reg_history = {name:collections.deque(maxlen=1800) for name in ("GHF","GLF","TOTAL")}
         self._compact = None
         self._selected_page = "Steuerung"
-        root.title("Nassheuer | Luftsteuerung | Testversion")
+        root.title("Nassheuer | Luftsteuerung | Testversion 2")
         root.geometry("1366x768")
         root.minsize(1024,700)
         root.configure(bg="#F2F6FA")
@@ -1016,6 +1037,26 @@ class AirflowApp:
         import math
         return f"{value:.{digits}f}".replace(".",",") if isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) else "—"
 
+    @staticmethod
+    def _regulation_indicator(reg,total,trustworthy,hardware=False):
+        """Nur Darstellung: Regelzustand und gemessene Abweichung getrennt bewerten."""
+        import math
+        if hardware:
+            return "Nur Lesen · Automatik aus","#536979","#E1EDF4"
+        state=str(reg.get("state","idle"))
+        if state=="error":
+            return "Regelungsfehler","#B42332","#FBE5E5"
+        if reg.get("active") and state=="running":
+            target=reg.get("target")
+            finite=lambda v:isinstance(v,(int,float)) and not isinstance(v,bool) and math.isfinite(v)
+            if not trustworthy or not finite(total) or not finite(target):
+                return "Rückmeldung prüfen","#986000","#FFF0D5"
+            if abs(total-target)>20.0:
+                return "Außerhalb ±20 m³/h","#986000","#FFF0D5"
+            return "Innerhalb ±20 m³/h","#167450","#DEF3E5"
+        label={"idle":"Bereit","waiting":"Warte auf Messbereich","paused":"Regelung angehalten"}.get(state,state)
+        return label,"#986000" if state=="waiting" else "#536979","#E1EDF4"
+
     def _reading(self,name,data,now):
         import math
         raw=dict(data.get("readings",{}).get(name,{}) or {})
@@ -1043,7 +1084,11 @@ class AirflowApp:
     def _render(self,snapshot,now):
         self._snapshot=snapshot
         hardware=snapshot.get("mode")=="hardware_readonly"
-        self._banner.configure(text="HARDWARE · NUR LESEN · keine realen Ausgangsbefehle · vorhandene Ausgangswerte bleiben unverändert" if hardware else "SIMULATION · Testversion · keine realen Ausgangsbefehle",bg="#FFF0D5" if hardware else "#DCEFF4",fg="#805100" if hardware else "#126B80")
+        build=str((snapshot.get("settings",{}) or {}).get("build","Testversion 2"))
+        if build!=getattr(self,"_shown_build",None):
+            self.root.title("Nassheuer | Luftsteuerung | "+build)
+            self._shown_build=build
+        self._banner.configure(text="HARDWARE · NUR LESEN · keine realen Ausgangsbefehle · vorhandene Ausgangswerte bleiben unverändert" if hardware else "SIMULATION · "+build+" · keine realen Ausgangsbefehle",bg="#FFF0D5" if hardware else "#DCEFF4",fg="#805100" if hardware else "#126B80")
         self._display={name:self._reading(name,snapshot,now) for name in ("GHF","GLF")}
         reg=snapshot.get("regulation",{}) or {}
         mode=reg.get("mode","BOTH")
@@ -1078,10 +1123,13 @@ class AirflowApp:
         for history in list(self._history.values())+list(self._reg_history.values()):
             while history and history[0][0]<now-60:history.popleft()
         running=bool(reg.get("active"))
-        state=str(reg.get("state","idle"))
-        label={"idle":"Bereit","running":"Regelung aktiv","waiting":"Warte auf Messbereich","paused":"Regelung angehalten","error":"Regelungsfehler"}.get(state,state)
-        if hardware:label="Nur Lesen · Automatik aus"
-        self._reg_state.configure(text=label,fg="#167450" if running and state=="running" else "#B42332" if state=="error" else "#536979",bg="#DEF3E5" if running and state=="running" else "#E1EDF4")
+        trustworthy=not stale and not faulty and all(
+            self._display[n]["flow"] is not None and
+            (50.0 if n=="GHF" else 10.0)<=self._display[n]["flow"]<=(449.0 if n=="GHF" else 100.0)
+            for n in active)
+        self._total_trustworthy=trustworthy
+        label,fg,bg=self._regulation_indicator(reg,total,trustworthy,hardware)
+        self._reg_state.configure(text=label,fg=fg,bg=bg)
         reason=str(reg.get("reason","") or "Gesamtsollwert eingeben.")
         if reg.get("glf_low_seconds",0)>0:reason+=" · GLF unter 5: "+self._number(reg["glf_low_seconds"],1)+"/10 s"
         if hardware:reason="Hardwaremodus liest nur Sensoren. Vorhandene reale Ausgangswerte werden beim Starten und Schließen nicht geändert."
@@ -1152,7 +1200,7 @@ class AirflowApp:
             text(.833,y,label,"process_small","w")
             value_color="#986000" if stale and y==.38 else "#142D3B"
             if label=="Abweichung" and isinstance(value,(int,float)) and math.isfinite(value):
-                value_color="#167450" if abs(value)<=20.0 else "#986000"
+                value_color="#167450" if getattr(self,"_total_trustworthy",False) and abs(value)<=20.0 else "#986000"
             text(.975,y,self._number(value)+" m³/h","process_small","e",color=value_color)
         text(.515,.95,"Grundlast GHF · Feinkorrektur GLF" if self._compact else "GHF hält die Grundlast · GLF korrigiert kleine Abweichungen","process_small")
 
@@ -1160,7 +1208,7 @@ class AirflowApp:
         settings=snapshot.get("settings",{}) or {}
         pid=settings.get("pid",settings.get("PID",{})) or {}
         defaults={"GHF":{"kc":.9,"ti_min":.108,"td_min":.007},"GLF":{"kc":.32,"ti_min":.075,"td_min":.001}}
-        lines=["PID-Parameter der Testversion · Ti/Td in Minuten (intern in Sekunden)"]
+        lines=["Build: "+str(settings.get("build","Testversion 2"))+" · PID Ti/Td in Minuten (intern in Sekunden)"]
         for name in ("GLF","GHF"):
             p=pid.get(name,defaults[name])
             lines.append(f"{name}: Kc {self._number(p.get('kc'),3)} · Ti {self._number(p.get('ti_min'),3)} min · Td {self._number(p.get('td_min'),3)} min")
@@ -1348,6 +1396,35 @@ def run_self_tests():
             before = reg.base
             reg.retarget(305)
             self.assertEqual(before, reg.base)
+
+        def test_combined_closed_loop_stays_within_tolerance(self):
+            # Reale Hardware wird hier NICHT nachgebildet oder angesprochen.
+            # Regression fuer den Koordinator: GLF-Vollaussteuerung darf nicht
+            # unbemerkt zu einem bleibenden Gesamtfehler im Testmodell fuehren.
+            for target in (92.0, 150.0, 250.0, 300.0):
+                with self.subTest(target=target):
+                    plant = SimulatedPlant(now=100.0)
+                    reg = AirflowRegulator()
+                    reg.start(RegulatorConfig(mode="BOTH", target=target), plant.sample(), plant.time, plant.commands)
+                    tail = []
+                    for step in range(1, 2401):
+                        sample = plant.step(0.05, reg.commands)
+                        commands, state = reg.update(sample, plant.time)
+                        self.assertTrue(state["active"])
+                        if step > 2000:
+                            tail.append(abs(sum(sample.flows().values()) - target))
+                    self.assertLessEqual(max(tail), 20.0)
+                    if target == 300.0:
+                        self.assertLess(abs(sum(sample.flows().values()) - target), 2.0)
+
+        def test_tolerance_status_requires_fresh_finite_feedback(self):
+            state = {"active": True, "state": "running", "target": 300.0}
+            for actual in (280.0, 300.0, 320.0):
+                self.assertTrue(AirflowApp._regulation_indicator(state, actual, True, False)[0].startswith("Innerhalb"))
+            for actual in (279.99, 320.01):
+                self.assertTrue(AirflowApp._regulation_indicator(state, actual, True, False)[0].startswith("Außerhalb"))
+            for actual, trustworthy in ((float("nan"), True), (300.0, False)):
+                self.assertFalse(AirflowApp._regulation_indicator(state, actual, trustworthy, False)[0].startswith("Innerhalb"))
 
         def test_service_initial_sample_is_not_in_future(self):
             service = AirflowService(autostart=False)
