@@ -1,0 +1,3400 @@
+"""Nassheuer-Luftstrecke | Manuelle Steuerung und Strommessung.
+
+Programmzweck
+--------------
+- Zwei analoge Sensorsignale (NI-9253) kontinuierlich auslesen.
+- Den FU manuell über den NI-9266 ansteuern (nach Bedienerfreigabe).
+- FU, GLF und GHF nach Bedienerbestätigung manuell ansteuern.
+- GLF/GHF verwenden die bestätigte lineare Kennlinie 0–100 % = 0–20 mA.
+
+SICHERHEIT
+----------a
+Dies ist eine Bedienoberfläche, keine sicherheitsgerichtete Steuerung.
+Weder ein erfolgreicher DAQ-Schreibaufruf noch task.close() beweisen einen
+sicheren Anlagenzustand. Keine Ausgaben beim Programmstart oder beim Schließen.
+Vor dem realen Einsatz: NI-MAX-Adressen, Verdrahtung, Freigabe und eine
+unabhängige Abschaltmöglichkeit durch Verantwortliche prüfen lassen.
+"""
+
+from __future__ import annotations
+
+# Abhängigkeiten und Verantwortungen:
+# math: endliche Zahlen, Kennlinien und ausschließlich simulierte Signalverläufe.
+# time.monotonic: Messalter/Zeitabläufe unabhängig von Systemuhr oder Zeitzone.
+# argparse: ausdrückliche Betriebsmoduswahl am Programmeinstieg.
+# queue/threading: Datenübergabe und Ressourcenbesitz zwischen Tk und DAQ-Thread.
+# datetime: lesbare Uhrzeit im Ereignisprotokoll, niemals Messfrische.
+# customtkinter: vorhandenes Tkinter-basiertes GUI-Framework.
+# NI-DAQmx fehlt absichtlich hier: reine Simulation benötigt das Paket nicht.
+import math
+import time
+import argparse
+import queue
+import threading
+from dataclasses import dataclass
+from datetime import datetime
+from tkinter import messagebox
+from typing import Callable
+
+import customtkinter as ctk
+
+
+# ============================================================================
+# 1 | KONFIGURATION – HIER STEHEN ALLE ANLAGENSPEZIFISCHEN WERTE
+# ============================================================================
+# Die Gerätebezeichnungen stammen aus der bereitgestellten Bedienungsanleitung.
+# Unbedingt mit NI-MAX und der tatsächlichen Verdrahtung vergleichen.
+# Namen aus dem vorhandenen Projektcode unverändert übernommen.
+# Die im Altkommentar genannte Bedienungsanleitung ist hier kein geprüfter Nachweis.
+# Gerätekennung, Modulposition und Klemmen vor realem Einsatz vor Ort bestätigen.
+DEVICE = "cDAQ9183-251EC5D"
+# Explizite Ausgangszuordnung statt Annahme aus der Reihenfolge von GUI-Karten.
+# FU -> ao0, GLF -> ao1, GHF -> ao2; Task-Konfiguration und Anzeige teilen die Quelle.
+AO_CHANNELS = {
+    "FU": "cDAQ9183-251EC5DMod1/ao0",
+    "GLF": "cDAQ9183-251EC5DMod1/ao1",
+    "GHF": "cDAQ9183-251EC5DMod1/ao2",
+}
+# Eingangskanäle haben einen eigenen Vertrag: Rückgabe stets (GHF/ai0, GLF/ai1).
+AI_GHF = "cDAQ9183-251EC5DMod2/ai0"
+AI_GLF = "cDAQ9183-251EC5DMod2/ai1"
+# Reihenfolge stimmt mit dem gemeinsamen NI-Mess-Task überein. Die Bewertung
+# und Darstellung erfolgen trotzdem unabhängig für jede einzelne Messstelle.
+SENSOR_CHANNELS = {"GHF": AI_GHF, "GLF": AI_GLF}
+
+# Verschiedene Begriffe nicht vermischen: DAQ-Konfigurationsbereich,
+# erwarteter Sensorbereich, Stellgliedkennlinie und tatsächlicher Anlagenzustand.
+# Die Konstanten sind übernommene Vorgaben, keine neu bestätigten Modulgrenzen.
+MIN_OUTPUT_A = 0.0
+MAX_OUTPUT_A = 0.020              # NI-9266: 0–20 mA
+SENSOR_ZERO_A = 0.004            # Sensor-Bezugspunkt: 4 mA
+SENSOR_MAX_A = 0.020           # Erwartetes oberes Sensorsignal
+SENSOR_VALID_MIN_A = 0.0035    # +-0,5mA Toleranz
+SENSOR_VALID_MAX_A = 0.0205    # +-0,5mA Toleranz
+
+# Dimensionsprüfung: (A - A) / (A je m³/h) ergibt m³/h.
+# Sensorfaktoren dürfen keine Aktuatorkennlinie allein aufgrund gleicher Einheit ersetzen.
+GHF_SENSOR_FACTOR = 0.0000356   # A je m³/h; vorhandene Messformel
+GLF_SENSOR_FACTOR = 0.00016     # A je m³/h; vorhandene Messformel
+GHF_REFERENCE_M3H = 449.0       # Bezugswert der alten Durchfluss-Prozentfunktion
+GLF_REFERENCE_M3H = 100.0       # Bezugswert der alten Durchfluss-Prozentfunktion
+
+# Erfassung und Anzeige besitzen verschiedene Takte: kontinuierliche Samples im
+# Task, gemittelte Pakete für die GUI. Frischegrenze ist nur Software-Plausibilität.
+SAMPLE_RATE_HZ = 1000           # NI-9253: 1000 Samples/s und Kanal
+GUI_REFRESH_MS = 50            # GUI wird ca. 20-mal/s aktualisiert
+MAX_MEASUREMENT_AGE_S = 1.0    # Nur Software-Plausibilität, keine Safety-Funktion
+
+# Die Stellgliedkennlinien werden ausdrücklich getrennt von den Sensorformeln geführt.
+# FU: 0–100 % = 4–20 mA. GLF/GHF: 0–100 % = 0–20 mA.
+# Die linearen GLF/GHF-Kennlinien wurden vom Benutzer am 3. November 2026 bestätigt.
+# Kennlinienfunktionen rechnen Prozent -> Ampere und haben keine Hardware-Seiteneffekte.
+CONFIGURED_ACTUATOR_CURVES: dict[str, Callable[[float], float]] = {}
+
+
+# Prüft, ob ein Prozentwert zwischen 0 und 100 liegt. Auch NaN und True/False sind ungültig.
+def validate_percent(value: float, name: str) -> float:
+    """Eine endliche Zahl einschließlich 0 und 100 Prozent verlangen."""
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or not 0 <= value <= 100):
+        raise ValueError(f"{name}: Nur Werte von 0 bis 100 % zulässig.")
+    return float(value)
+
+
+# Liest einen Prozentwert aus dem Eingabefeld. Leer bedeutet: Diesen Kanal nicht ändern.
+def parse_percent(text: str, name: str) -> float | None:
+    """Ein leeres Feld ist 'unverändert'; Dezimalkommas sind erlaubt."""
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    try:
+        value = float(cleaned.replace(",", "."))
+    except ValueError as exc:
+        raise ValueError(f"{name}: Bitte eine gültige Zahl eingeben.") from exc
+    return validate_percent(value, name)
+
+
+# Prüft, ob der Stromwert in der konfigurierten Spanne von 0 bis 20 mA liegt.
+def validate_current(current_a: float) -> float:
+    """Den NI-9266-Ausgangsbereich ohne NaN oder Infinity erzwingen."""
+    if (isinstance(current_a, bool) or not isinstance(current_a, (int, float))
+            or not math.isfinite(current_a)
+            or not MIN_OUTPUT_A <= current_a <= MAX_OUTPUT_A):
+        raise ValueError(
+            f"Strom-Sollwert muss zwischen {MIN_OUTPUT_A * 1000:g} mA "
+            f"und {MAX_OUTPUT_A * 1000:g} mA liegen."
+        )
+    return float(current_a)
+
+
+# Rechnet den FU-Sollwert um: 0 % = 4 mA, 100 % = 20 mA.
+def fu_percent_to_amp(percent: float) -> float:
+    """Bekannte FU-Skalierung: 0 % = 4 mA und 100 % = 20 mA."""
+    percent = validate_percent(percent, "FU")
+    return validate_current(SENSOR_ZERO_A + percent / 100 * 0.016)
+
+
+# Umgekehrte GLF-Kennlinie:
+# 0 % = 20 mA und 100 % = 4 mA.
+def glf_percent_to_amp(percent: float) -> float:
+    """GLF-Sollwert umgekehrt linear von 20 mA auf 4 mA skalieren."""
+    percent = validate_percent(percent, "GLF")
+
+    # 0 %   -> 0.020 A
+    # 50 %  -> 0.012 A
+    # 100 % -> 0.004 A
+    current_a = MAX_OUTPUT_A - percent / 100 * (
+        MAX_OUTPUT_A - SENSOR_ZERO_A
+    )
+
+    return validate_current(current_a)
+
+
+# Umgekehrte GHF-Kennlinie:
+# 0 % = 20 mA und 100 % = 4 mA.
+def ghf_percent_to_amp(percent: float) -> float:
+    """GHF-Sollwert umgekehrt linear von 20 mA auf 4 mA skalieren."""
+    percent = validate_percent(percent, "GHF")
+
+    # 0 %   -> 0.020 A
+    # 50 %  -> 0.012 A
+    # 100 % -> 0.004 A
+    current_a = MAX_OUTPUT_A - percent / 100 * (
+        MAX_OUTPUT_A - SENSOR_ZERO_A
+    )
+
+    return validate_current(current_a)
+
+# Berechnet den GHF-Durchfluss aus dem Sensorstrom. Das ist keine Schieberposition.
+def ghf_amp_to_m3h(current_a: float) -> float:
+    """GHF-SENSORstrom in Durchfluss umrechnen (nicht Gleitschieberposition)."""
+    return (current_a - SENSOR_ZERO_A) / GHF_SENSOR_FACTOR
+
+
+# Berechnet den GLF-Durchfluss aus dem Sensorstrom. Das ist keine Schieberposition.
+def glf_amp_to_m3h(current_a: float) -> float:
+    """GLF-SENSORstrom in Durchfluss umrechnen (nicht Gleitschieberposition)."""
+    return (current_a - SENSOR_ZERO_A) / GLF_SENSOR_FACTOR
+
+
+# Rechnet den FU-Strom in einen Prozentwert zurück. Das ist keine echte Rückmessung.
+def fu_amp_to_percent(current_a: float) -> float:
+    """Umkehrfunktion der vorgegebenen FU-Sollwert-Skalierung."""
+    return (current_a - SENSOR_ZERO_A) / 0.016 * 100
+
+
+# Alte Bezugsrechnung für den GHF-Sensor. Nicht für die Stellgliedausgabe verwenden.
+def ghf_reference_percent_to_amp(percent: float) -> float:
+    """Alte GHF-Formel: % des Durchfluss-Bezugswerts -> Sensorstrom.
+
+    NICHT als Stellstrom für den GHF-Gleitschieber verwenden!
+    """
+    percent = validate_percent(percent, "GHF-Durchflussbezug")
+    return SENSOR_ZERO_A + percent / 100 * GHF_REFERENCE_M3H * GHF_SENSOR_FACTOR
+
+
+# Alte Bezugsrechnung für den GLF-Sensor. Nicht für die Stellgliedausgabe verwenden.
+def glf_reference_percent_to_amp(percent: float) -> float:
+    """Alte GLF-Formel: % des Durchfluss-Bezugswerts -> Sensorstrom.
+
+    NICHT als Stellstrom für den GLF-Gleitschieber verwenden!
+    """
+    percent = validate_percent(percent, "GLF-Durchflussbezug")
+    return SENSOR_ZERO_A + percent / 100 * GLF_REFERENCE_M3H * GLF_SENSOR_FACTOR
+
+
+# Vergleicht den GHF-Durchfluss mit dem Bezugswert von 449 m³/h.
+def ghf_amp_to_reference_percent(current_a: float) -> float:
+    """GHF-Durchfluss in % von 449 m³/h (nicht Schieberöffnung)."""
+    return ghf_amp_to_m3h(current_a) / GHF_REFERENCE_M3H * 100
+
+
+# Vergleicht den GLF-Durchfluss mit dem Bezugswert von 100 m³/h.
+def glf_amp_to_reference_percent(current_a: float) -> float:
+    """GLF-Durchfluss in % von 100 m³/h (nicht Schieberöffnung)."""
+    return glf_amp_to_m3h(current_a) / GLF_REFERENCE_M3H * 100
+
+
+# Prüft alle ausgefüllten Eingaben vor der Ausgabe und berechnet die Sollströme.
+def prepare_commands(raw_entries: dict[str, str]) -> list[tuple[str, float, float]]:
+    """Alle Eingaben VOR dem ersten DAQ-Write prüfen.
+
+    Ergebnis: [(Gerät, Prozent, Strom_in_A), ...].
+    Ein fehlender/gesperrter Kanal stoppt die gesamte Übernahme.
+    """
+    # Hier werden nur validierte Absichten gesammelt, noch keine Befehle ausgeführt.
+    commands = []
+    for name in ("FU", "GLF", "GHF"):
+        value = parse_percent(raw_entries.get(name, ""), name)
+        if value is None:
+            continue
+        # Keine Kennlinie durch einen geratenen Standard oder eine Sensorformel ersetzen.
+        curve = CONFIGURED_ACTUATOR_CURVES.get(name)
+        if curve is None:
+            raise RuntimeError(
+                f"{name}: Reale Ausgabe gesperrt – Stellgliedkennlinie nicht bestätigt."
+            )
+        commands.append((name, value, validate_current(curve(value))))
+    return commands
+
+
+# Alle drei bestätigten Kennlinien zentral registrieren. Diese Registrierung
+# aktiviert die Eingabefelder und erlaubt dem Worker die jeweilige Ausgabe.
+# Eine betriebliche Anlagenfreigabe und der Bestätigungsdialog bleiben erforderlich.
+CONFIGURED_ACTUATOR_CURVES["FU"] = fu_percent_to_amp
+CONFIGURED_ACTUATOR_CURVES["GLF"] = glf_percent_to_amp
+CONFIGURED_ACTUATOR_CURVES["GHF"] = ghf_percent_to_amp
+
+
+# Bündelt echte NI-DAQ-Aufrufe und verwaltet Mess- und Ausgangs-Tasks.
+class DaqController:
+    """Besitzt den Mess-Task und die unabhängigen Ausgangs-Tasks.
+
+    Die Klasse erstellt beim Initialisieren KEINE NI-DAQ-Tasks.
+    Sie gibt niemals eigenständig einen Abschaltstrom aus.
+    """
+
+    # Merkt sich den Treiber, die Tasks und den Ausgabestatus. Legt noch keinen Task an.
+    def __init__(self, driver=None) -> None:
+        # Testtreiber und echter Treiber erfüllen denselben aufrufbaren Adaptervertrag.
+        self.driver = driver
+        self.measurement_task = None
+        self.output_tasks: dict[str, object] = {}
+        # Nur bestätigte Sollströme speichern. Ein späterer Fehler kann den realen
+        # Ausgang trotzdem unbekannt machen; diese Historie ist keine Rückmessung.
+        self.last_written: dict[str, float] = {}
+        # Ein Versuch bleibt bis Programmende erinnerbar, auch nach Task-Freigabe.
+        self.output_attempted = False
+        # Verriegelung ohne automatischen Reset: Teilaufträge nie blind wiederholen.
+        self.output_fault = False
+
+    # Richtet beide Messkanäle in einem Task ein und startet die Erfassung.
+    def start_measurement(self) -> None:
+        """Zwei Strommesseingänge in einem kontinuierlichen Task starten."""
+        if self.measurement_task is not None:
+            raise RuntimeError("Der Mess-Task existiert bereits.")
+
+        # Verzögerter Import hält die Demonstration ohne installierte NI-Software möglich.
+        if self.driver is None:
+            try:
+                import nidaqmx
+            except ImportError as exc:
+                raise RuntimeError("NI-DAQmx-Pythonpaket fehlt. Siehe README (Hardwarebetrieb).") from exc
+            self.driver = nidaqmx
+        # Ab jetzt existiert eine Ressource, auch wenn Konfiguration/Start noch scheitert.
+        task = self.driver.Task()
+        try:
+            # Kanalreihenfolge bestimmt später data[0] und data[1].
+            task.ai_channels.add_ai_current_chan(
+                AI_GHF, min_val=0.0035, max_val=0.020
+            )
+            task.ai_channels.add_ai_current_chan(
+                AI_GLF, min_val=0.0035, max_val=0.020
+            )
+            # Beide Kanäle teilen denselben kontinuierlichen Messauftrag.
+            task.timing.cfg_samp_clk_timing(
+                rate=SAMPLE_RATE_HZ,
+                sample_mode=self.driver.constants.AcquisitionType.CONTINUOUS,
+            )
+            task.start()
+        except Exception:
+            try:
+                task.close()
+            except Exception:
+                # Referenz behalten, wenn das Schließen misslingt.
+                self.measurement_task = task
+            raise
+        self.measurement_task = task
+
+    # Liest neue Samples und bildet je Kanal den Mittelwert in Ampere.
+    def read_currents(self) -> tuple[float | None, float | None] | None:
+        """Verfügbare Samples mitteln; Rückgabe in Ampere (GHF, GLF)."""
+        if self.measurement_task is None:
+            raise RuntimeError("Es existiert kein laufender Mess-Task.")
+
+        data = self.measurement_task.read(
+            number_of_samples_per_channel=self.driver.constants.READ_ALL_AVAILABLE,
+            timeout=0.5,
+        )
+        if len(data) == 0:
+            return None  # Direkt nach Task-Start kann der Puffer leer sein.
+        # Abweichende Datenstruktur darf keine stillschweigende Kanalvertauschung ergeben.
+        if len(data) != 2:
+            raise RuntimeError("DAQ lieferte nicht die erwarteten zwei Kanäle.")
+        # Ein leerer Kanal wird unten separat als fehlend markiert. Zwei
+        # nichtleere, unterschiedlich lange Puffer bleiben dagegen ein gemeinsamer
+        # Strukturfehler des synchron angeforderten Zweikanal-Tasks.
+        if data[0] and data[1] and len(data[0]) != len(data[1]):
+            raise RuntimeError("DAQ lieferte unterschiedlich lange Kanalpuffer.")
+        # Ein fehlender oder ungültiger Kanal darf den anderen nicht verwerfen.
+        # None bedeutet fehlende Samples; NaN bedeutet ungültige Samples. Echte
+        # Task.read()-Fehler und eine falsche Kanalanzahl bleiben gemeinsame Fehler.
+        def average_channel(samples) -> float | None:
+            if not samples:
+                return None
+            if any(not math.isfinite(value) for value in samples):
+                return math.nan
+            return sum(samples) / len(samples)
+
+        # Die Rohwerte bleiben Ampere, einschließlich endlicher Werte außerhalb
+        # 4–20 mA. Nur so kann die GUI z. B. 0,000 mA als Fehlerwert anzeigen.
+        return average_channel(data[0]), average_channel(data[1])
+
+    # Gibt den geprüften Sollstrom auf dem benannten Kanal aus und meldet Fehler.
+    def write_current(self, name: str, current_a: float) -> None:
+        """Manueller Schreibversuch; frühere Fehler sperren nicht alle Kanäle."""
+        if name not in AO_CHANNELS:
+            raise ValueError(f"Unbekannter Ausgang: {name}")
+        if name not in CONFIGURED_ACTUATOR_CURVES:
+            raise RuntimeError(f"{name}: Keine bestätigte Stellgliedkennlinie.")
+        current_a = validate_current(current_a)
+
+        # Fehler pro Ausgang merken, statt die gesamte Bedienung zu verriegeln.
+        if not hasattr(self, "_failed_outputs"):
+            self._failed_outputs = set()
+
+        # Nur ein neuer Bedienauftrag löst einen erneuten Versuch aus.
+        # Einen unvollständig konfigurierten Task nicht wiederverwenden.
+        if name in self._failed_outputs:
+            previous_task = self.output_tasks.get(name)
+            if previous_task is not None:
+                try:
+                    previous_task.close()
+                except Exception as exc:
+                    self.output_fault = True
+                    raise RuntimeError(
+                        f"{name} / {AO_CHANNELS[name]}: Vorherigen Ausgangs-Task "
+                        f"nicht freigegeben; kein neuer Task angelegt. "
+                        f"Der neue Sollstrom wurde nicht geschrieben. {exc}"
+                    ) from exc
+                else:
+                    self.output_tasks.pop(name, None)
+
+        self.output_attempted = True
+        task = self.output_tasks.get(name)
+        newly_created = task is None
+        operation = "Strom schreiben"
+
+        try:
+            if newly_created:
+                operation = "Ausgangs-Task anlegen"
+                if self.driver is None:
+                    import nidaqmx
+                    self.driver = nidaqmx
+
+                task = self.driver.Task()
+                self.output_tasks[name] = task
+
+                operation = "Stromkanal konfigurieren"
+                task.ao_channels.add_ao_current_chan(
+                    AO_CHANNELS[name],
+                    min_val=MIN_OUTPUT_A,
+                    max_val=MAX_OUTPUT_A,
+                )
+
+            operation = "Strom schreiben"
+            count = task.write(current_a, auto_start=True, timeout=5.0)
+            if count != 1:
+                raise RuntimeError("DAQ bestätigte nicht genau ein Sample.")
+
+            self.last_written[name] = current_a
+            self._failed_outputs.discard(name)
+            self.output_fault = bool(self._failed_outputs)
+
+        except Exception as exc:
+            self._failed_outputs.add(name)
+            self.output_fault = True
+            # Referenz nur nach bestätigtem close() entfernen.
+            if newly_created and task is not None:
+                try:
+                    task.close()
+                except Exception:
+                    pass
+                else:
+                    self.output_tasks.pop(name, None)
+
+            raise RuntimeError(
+                f"{name} / {AO_CHANNELS[name]}: {operation} für "
+                f"{current_a * 1000:.3f} mA fehlgeschlagen. {exc}"
+            ) from exc
+
+    # Schließt nur den Mess-Task, etwa nach einem Lesefehler.
+    def close_measurement(self) -> list[str]:
+        """Nur den Mess-Task nach einem Lesefehler freigeben.
+
+        Die Ausgabe-Tasks werden NICHT angefasst. Ein Fehler bleibt sichtbar.
+        """
+        if self.measurement_task is None:
+            return []
+        try:
+            self.measurement_task.close()
+        except Exception as exc:
+            return [str(exc)]
+        self.measurement_task = None
+        return []
+
+    # Schreibt vor dem Freigeben der Tasks alle drei Ausgänge auf 4 mA.
+    def close_tasks(self) -> list[str]:
+        """FU 0 %, GLF/GHF 100 % anfordern und danach die Tasks freigeben."""
+        problems: list[str] = []
+        shutdown_current_a = 0.004  # 4 mA in Ampere
+
+        # Auch bisher unbenutzte Ausgänge müssen ihren Abschlusswert erhalten.
+        for name in ("FU", "GLF", "GHF"):
+            task = self.output_tasks.get(name)
+            newly_created = task is None
+            self.output_attempted = True
+
+            try:
+                validate_current(shutdown_current_a)
+
+                if newly_created:
+                    # Deckt auch Schließen vor dem Start der Messung ab.
+                    if self.driver is None:
+                        import nidaqmx
+                        self.driver = nidaqmx
+
+                    task = self.driver.Task()
+                    self.output_tasks[name] = task
+                    task.ao_channels.add_ao_current_chan(
+                        AO_CHANNELS[name],
+                        min_val=MIN_OUTPUT_A,
+                        max_val=MAX_OUTPUT_A,
+                    )
+
+                # Fest vorgegebener Endwert, keine normale Sollwertübernahme.
+                # Eine bestehende Fehlersperre wird dabei NICHT zurückgesetzt.
+                count = task.write(
+                    shutdown_current_a, auto_start=True, timeout=5.0
+                )
+                if count != 1:
+                    raise RuntimeError("DAQ bestätigte nicht genau ein Sample.")
+
+                self.last_written[name] = shutdown_current_a
+
+            except Exception as exc:
+                self.output_fault = True
+                problems.append(f"{name}: 4-mA-Befehl fehlgeschlagen: {exc}")
+
+                # Einen neu angelegten, fehlgeschlagenen Task sauber entfernen.
+                if newly_created and task is not None:
+                    try:
+                        task.close()
+                    except Exception as close_exc:
+                        problems.append(f"{name}: Task-Freigabe fehlgeschlagen: {close_exc}")
+                    else:
+                        self.output_tasks.pop(name, None)
+
+        # Bei einem Fehler bleibt das Fenster für einen erneuten Versuch offen.
+        # Bereits vorhandene Tasks behalten wir bis zum nächsten Schließversuch.
+        if problems:
+            return problems
+
+        # Erst nach drei bestätigten Schreibaufrufen die Ausgabetasks freigeben.
+        for name, task in list(self.output_tasks.items()):
+            try:
+                task.close()
+            except Exception as exc:
+                problems.append(f"{name}-Ausgang: {exc}")
+            else:
+                del self.output_tasks[name]
+
+        if self.measurement_task is not None:
+            try:
+                self.measurement_task.close()
+            except Exception as exc:
+                problems.append(f"Messung: {exc}")
+            else:
+                self.measurement_task = None
+
+        if problems:
+            self.output_fault = True
+        return problems
+
+
+# Ersetzt NI-Hardware durch Beispieldaten. Es werden keine echten Ausgänge angesprochen.
+class SimulatedDaqController(DaqController):
+    """Deterministische Demonstration; importiert und verwendet kein NI-DAQmx.
+
+    Sensorsignale sind unabhängige Beispieldaten, kein physikalisches Anlagenmodell.
+    Die Simulation verwendet dieselben bestätigten Kennlinien und schreibt nie
+    auf reale NI-Hardware.
+    """
+
+    # Übernimmt den Softwarezustand, ohne NI-Hardware anzusprechen.
+    def __init__(self) -> None:
+        super().__init__()
+        self.started_at = 0.0
+
+    # Markiert die simulierte Messung als gestartet.
+    def start_measurement(self) -> None:
+        if self.measurement_task is not None:
+            raise RuntimeError("Der simulierte Mess-Task existiert bereits.")
+        # Reiner Existenzmarker ohne Treibermethoden; Close ist deshalb ebenfalls überschrieben.
+        self.measurement_task = object()
+        self.started_at = time.monotonic()
+
+    # Liefert zwei leicht schwankende Beispielströme.
+    def read_currents(self) -> tuple[float, float]:
+        if self.measurement_task is None:
+            raise RuntimeError("Simulierte Messung nicht gestartet.")
+        phase = (time.monotonic() - self.started_at) / 8
+        return (0.012 + math.sin(phase) * 0.0003,
+                0.010 + math.cos(phase) * 0.0002)
+
+    # Merkt sich einen simulierten Stellbefehl, ohne Strom auszugeben.
+    def write_current(self, name: str, current_a: float) -> None:
+        if name not in AO_CHANNELS or name not in CONFIGURED_ACTUATOR_CURVES:
+            raise RuntimeError(f"{name}: Keine freigegebene Kennlinie.")
+        current_a = validate_current(current_a)
+        self.output_attempted = True
+        self.output_tasks.setdefault(name, object())
+        self.last_written[name] = current_a
+        self.output_fault = False
+
+    # Entfernt den Marker der simulierten Messung.
+    def close_measurement(self) -> list[str]:
+        self.measurement_task = None
+        return []
+
+    # Entfernt alle simulierten Task-Marker.
+    def close_tasks(self) -> list[str]:
+        self.output_tasks.clear()
+        self.measurement_task = None
+        return []
+
+
+@dataclass(frozen=True)
+class SensorReading:
+    """Rohstrom, Empfangszeit und Fehlergrund genau eines Eingangskanals.
+
+    Auch ein unplausibler Strom ist ein empfangener Rohwert. Er wird angezeigt,
+    gilt aber nicht als gültige Durchflussmessung oder als Ausgabefreigabe.
+    """
+
+    current_a: float | None = None
+    received_at: float = 0.0
+    problem: str | None = "Warte auf Messdaten"
+
+    @property
+    def valid(self) -> bool:
+        return (
+            self.problem is None
+            and self.current_a is not None
+            and math.isfinite(self.current_a)
+            and SENSOR_VALID_MIN_A <= self.current_a <= SENSOR_VALID_MAX_A
+        )
+
+    def recent(self, now: float) -> bool:
+        # Frische wird auch für unplausible Rohwerte bestimmt. 0 mA ist nicht
+        # dasselbe wie ein fehlender Wert; daher niemals per Wahrheitswert prüfen.
+        return self.received_at > 0 and now - self.received_at <= MAX_MEASUREMENT_AGE_S
+
+
+def evaluate_sensor_currents(currents, received_at: float) -> dict[str, SensorReading]:
+    """Jeden Sensor unabhängig prüfen, ohne Hardware oder Widgets anzusprechen."""
+    if currents is None:
+        currents = (None, None)
+    if len(currents) != len(SENSOR_CHANNELS):
+        raise ValueError("Messdaten enthalten nicht die erwarteten zwei Kanäle.")
+    readings = {}
+    for name, current in zip(SENSOR_CHANNELS, currents):
+        if current is None:
+            problem = "Keine neuen Samples · Messwert fehlt"
+        elif not math.isfinite(current):
+            problem = "Ungültiger Zahlenwert im Sensorsignal"
+        elif not SENSOR_VALID_MIN_A <= current <= SENSOR_VALID_MAX_A:
+            problem = (
+                "Sensorsignal außerhalb des Softwarebereichs "
+                f"{SENSOR_VALID_MIN_A * 1000:.1f}–"
+                f"{SENSOR_VALID_MAX_A * 1000:.1f} mA"
+            ).replace(".", ",")
+        else:
+            problem = None
+        readings[name] = SensorReading(current, received_at, problem)
+    return readings
+
+
+# Der Worker übergibt seinen Status als Daten an die Oberfläche.
+# Booleans und Task-Namen dokumentieren Ressourcenbesitz der Software.
+# Kein Feld behauptet eine sichere Anlage oder gemessenen Ausgangsstrom.
+@dataclass(frozen=True)
+class DaqState:
+    measurement_task: bool
+    output_tasks: tuple[str, ...]
+    output_attempted: bool
+    output_fault: bool
+
+
+# Führt Messung und Ausgaben außerhalb des GUI-Threads aus.
+class DaqWorker(threading.Thread):
+    """Einziger Besitzer der DAQ-Tasks; GUI erhält nur unveränderliche Ereignisse.
+
+    Schließanforderungen sperren neue Writes sofort. Ein bereits laufender
+    Treiberaufruf ist nicht abbrechbar; die GUI wartet auf dessen Abschluss.
+    """
+
+    # Erstellt die Queues und Zustandsvariablen für den Worker.
+    def __init__(self, controller: DaqController) -> None:
+        super().__init__(name="Luftsteuerung-DAQ", daemon=False)
+        self.controller = controller
+        # Ereignisformat jeweils (Art, Nutzdaten), Richtung Worker -> Tk:
+        # measurement: (dict[str, SensorReading], monotone_Lesezeit)
+        # Jede SensorReading enthält ihren eigenen Rohwert und Fehlerstatus.
+        self.events: queue.Queue = queue.Queue()
+        # Befehle Tk -> Worker: „write“ oder „close“. Keine Widgets in Nutzdaten ablegen.
+        self.commands: queue.Queue = queue.Queue()
+        # Sofortige Sperrabsicht mit Vorrang vor der Queue-Position des close-Befehls.
+        self.close_requested = threading.Event()
+        self.last_valid_at = 0.0
+        self.measurement_valid = False
+        self.sensor_readings = {name: SensorReading() for name in SENSOR_CHANNELS}
+        self.measurement_running = False
+        self.shutdown_blocked = False
+        # Nur kurze Auftragsannahme schützen, keinen langsamen Treiberaufruf darunter halten.
+        self.accepted_lock = threading.Lock()
+        self.write_pending = False
+
+    # Erstellt einen Status-Schnappschuss ohne direkte Task-Objekte.
+    def state(self) -> DaqState:
+        return DaqState(self.controller.measurement_task is not None,
+                        tuple(self.controller.output_tasks),
+                        self.controller.output_attempted, self.controller.output_fault)
+
+    # Nimmt einen Stellauftrag an, wenn noch keiner läuft und kein Schließen geplant ist.
+    def request_write(self, commands: list[tuple[str, float, float]]) -> bool:
+        with self.accepted_lock:
+            if self.close_requested.is_set() or self.write_pending:
+                return False
+            self.write_pending = True
+        self.commands.put(("write", tuple(commands)))
+        return True
+
+    # Sperrt neue Aufträge und fordert das Schließen aller Tasks an.
+    def request_close(self) -> None:
+        self.close_requested.set()
+        self.commands.put(("close", ()))
+
+    # Prüft, ob ein gültiger Messwert höchstens eine Sekunde alt ist.
+    def _recent(self) -> bool:
+        return (self.measurement_valid and
+                time.monotonic() - self.last_valid_at <= MAX_MEASUREMENT_AGE_S)
+
+    # Liest Sensorströme und sendet Messwerte oder Fehlermeldungen zur GUI.
+    def _read(self) -> None:
+        try:
+            currents = self.controller.read_currents()
+            # Zeit im Besitzerthread erfassen, nicht erst bei späterer GUI-Verarbeitung.
+            acquired_at = time.monotonic()
+            self.sensor_readings = evaluate_sensor_currents(currents, acquired_at)
+            # Der gemeinsame Zustand dient ausschließlich der bisherigen
+            # Ausgabefreigabe. Die Messkarten verwenden ihre eigenen Zustände.
+            self.measurement_valid = all(reading.valid for reading in self.sensor_readings.values())
+            if self.measurement_valid:
+                self.last_valid_at = acquired_at
+            # Auch fehlerhafte/fehlende Rohwerte mit ihrem Empfangszeitpunkt an
+            # die GUI weitergeben. Kein Kanal wird wegen des anderen ausgeblendet.
+            self.events.put(("measurement", (self.sensor_readings.copy(), acquired_at)))
+        except Exception as exc:
+            self.measurement_valid = False
+            self.sensor_readings = {name: SensorReading(problem="DAQ-Messfehler")
+                                    for name in SENSOR_CHANNELS}
+            self.measurement_running = False
+            # Erfassung beenden, Ausgänge erhalten; fehlgeschlossene Task-Referenzen bleiben.
+            problems = self.controller.close_measurement()
+            self.events.put(("measurement_error", str(exc) +
+                             (" | Schließfehler: " + "; ".join(problems) if problems else "")))
+            self.events.put(("state", self.state()))
+
+    # Prüft einen Stellauftrag erneut und schreibt die Kanäle nacheinander.
+    def _write(self, commands) -> None:
+        successful = []
+        try:
+            if not commands:
+                raise ValueError("Leerer Ausgabeauftrag.")
+
+            # Alle Angaben vor dem ersten Hardwarezugriff überprüfen.
+            for name, percent, current in commands:
+                if name not in CONFIGURED_ACTUATOR_CURVES:
+                    raise RuntimeError(f"{name}: Stellgliedkennlinie fehlt.")
+                expected = validate_current(CONFIGURED_ACTUATOR_CURVES[name](
+                    validate_percent(percent, name)))
+                if validate_current(current) != expected:
+                    raise ValueError(f"{name}: Strom passt nicht zur Kennlinie.")
+
+            for name, percent, current in commands:
+                if self.close_requested.is_set() or self.shutdown_blocked:
+                    raise RuntimeError("Abschluss aktiv; Auftrag abgebrochen.")
+
+                # Dieser Pfad dient bestätigten manuellen Aufträgen.
+                # Fehlende Sensorfreigabe verhindert die Korrektur nicht.
+                self.controller.write_current(name, current)
+                successful.append((name, percent, current))
+
+            self.events.put(("write_ok", tuple(successful)))
+
+        except Exception as exc:
+            # Eingabe-/Abbruchfehler sind keine neuen Hardwarefehler.
+            # Echte Ausgangsfehler merkt der Controller pro Kanal.
+            self.events.put(("write_error", (str(exc), tuple(successful))))
+
+        finally:
+            with self.accepted_lock:
+                self.write_pending = False
+            self.events.put(("state", self.state()))
+
+    def request_restart_measurement(self) -> bool:
+        """Ein Messneustart wird wie ein Schreibauftrag serialisiert."""
+        with self.accepted_lock:
+            if self.close_requested.is_set() or self.write_pending:
+                return False
+            self.write_pending = True
+        self.commands.put(("restart_measurement", ()))
+        return True
+
+    def _restart_measurement(self) -> None:
+        """Nur die Messung neu verbinden; keine Ausgangswerte schreiben."""
+        self.measurement_running = False
+        self.measurement_valid = False
+        self.last_valid_at = 0.0
+        self.sensor_readings = {
+            name: SensorReading() for name in SENSOR_CHANNELS
+        }
+        self.events.put(("measurement_restarting", None))
+
+        try:
+            if self.close_requested.is_set() or self.shutdown_blocked:
+                raise RuntimeError("Abschluss aktiv; kein Messneustart.")
+
+            problems = self.controller.close_measurement()
+            if problems:
+                raise RuntimeError(
+                    "Alter Mess-Task nicht freigegeben: " + "; ".join(problems)
+                )
+
+            if self.close_requested.is_set():
+                raise RuntimeError("Abschluss angefordert; kein Messneustart.")
+
+            self.controller.start_measurement()
+            self.measurement_running = True
+            self.events.put(("started", None))
+
+        except Exception as exc:
+            self.events.put((
+                "measurement_error",
+                f"Messneustart für GHF ({AI_GHF}) und GLF ({AI_GLF}) "
+                f"fehlgeschlagen: {exc}",
+            ))
+
+        finally:
+            # Auch ein fehlgeschlagener Neustart muss die Bedienung freigeben.
+            with self.accepted_lock:
+                self.write_pending = False
+            self.events.put(("state", self.state()))
+            self.events.put(("measurement_restart_done", None))
+
+    # Initialisiert die Ausgänge, startet die Messung und bearbeitet danach Aufträge.
+    def run(self) -> None:
+        if not self.close_requested.is_set():
+            successful = []
+
+            # Feste Startwerte: FU 0 %, GLF/GHF 100 %, jeweils 4 mA.
+            # Direkt über den Controller schreiben: Vor der Messung gibt es
+            # noch keine gültigen Sensorwerte für die normale Sollwertübernahme.
+            try:
+                for name, percent in (
+                    ("FU", 0.0),
+                    ("GLF", 100.0),
+                    ("GHF", 100.0),
+                ):
+                    # Eine inzwischen angeforderte Schließung hat Vorrang.
+                    if self.close_requested.is_set():
+                        break
+
+                    self.controller.write_current(name, 0.004)
+                    successful.append((name, percent, 0.004))
+
+                # Erst nach drei bestätigten Writes vollständigen Erfolg melden.
+                if len(successful) == 3:
+                    self.events.put(("write_ok", tuple(successful)))
+
+            except Exception as exc:
+                # Bei einem Fehler keine weiteren Startwerte schreiben.
+                # Normale Stellbefehle bleiben gesperrt; Teilerfolge anzeigen.
+                self.controller.output_fault = True
+                self.events.put((
+                    "write_error",
+                    (
+                        f"Startinitialisierung auf 4 mA fehlgeschlagen: {exc}",
+                        tuple(successful),
+                    ),
+                ))
+
+            # Messung auch nach einem Ausgabefehler zur Diagnose starten.
+            if not self.close_requested.is_set():
+                try:
+                    self.controller.start_measurement()
+                    self.measurement_running = True
+                    self.events.put(("started", None))
+                except Exception as exc:
+                    self.events.put((
+                        "measurement_error",
+                        f"Messinitialisierung fehlgeschlagen: {exc}",
+                    ))
+
+        self.events.put(("state", self.state()))
+        next_read = time.monotonic()
+        while True:
+            # Abschluss hat Vorrang: Wiederanlauf sperren, dann Ressourcen freigeben.
+            if self.close_requested.is_set() and not self.shutdown_blocked:
+                self.shutdown_blocked = True
+                self.measurement_running = False
+                self.measurement_valid = False
+                problems = self.controller.close_tasks()
+                self.events.put(("state", self.state()))
+                if not problems:
+                    self.events.put(("closed", ()))
+                    return
+                # Nach Fehler nur erneute Freigabe derselben Ressourcen zulassen.
+                # Ein wartender Write wird verworfen, kein Wiedereinstieg in Messung.
+                while True:
+                    try:
+                        action, _ = self.commands.get_nowait()
+                    except queue.Empty:
+                        break
+                # Erst nach dem Verwerfen alter Aufträge eine Wiederholung anbieten.
+                # Andernfalls könnte die GUI bereits einen neuen Close-Auftrag senden,
+                self.events.put(("closed", tuple(problems)))
+                continue
+            try:
+                # Kurzes Warten vermeidet dauerhaftes Busy-Waiting bei leerer Befehlsqueue.
+                action, payload = self.commands.get(timeout=0.02)
+            except queue.Empty:
+                action = None
+            # Expliziter Wiederholungsversuch betrifft nur noch nicht freigegebene Ressourcen.
+            if action == "close" and self.shutdown_blocked:
+                problems = self.controller.close_tasks()
+                self.events.put(("state", self.state()))
+                self.events.put(("closed", tuple(problems)))
+                if not problems:
+                    return
+            elif action == "restart_measurement":
+                self._restart_measurement()
+                next_read = time.monotonic()
+            elif action == "write" and not self.close_requested.is_set():
+                # Vor jedem Auftrag nochmals aktuelle Samples holen.
+                if self.measurement_running:
+                    self._read()
+                self._write(payload)
+            now = time.monotonic()
+            if self.measurement_running and not self.close_requested.is_set() and now >= next_read:
+                self._read()
+                # Keine aufgestauten GUI-Leseaufrufe nachholen; neues Intervall ab Leseende.
+                next_read = time.monotonic() + GUI_REFRESH_MS / 1000
+
+
+# ============================================================================
+# 5 | OBERFLÄCHE – SOLLWERTE, MESSWERTE UND BESTÄTIGUNGEN GETRENNT
+# ============================================================================
+# Ruhige HMI-Palette: Petrol für Bedienung, Grün für plausible reale Messdaten,
+# Orange für unklare/gesperrte Zustände und Rot für Fehler. Simulation bleibt blau.
+# Jeder bedeutsame Zustand wird zusätzlich mit verständlichem Text bezeichnet.
+COLOR_DARK = "#142D3B"
+COLOR_BLUE = "#126B80"
+COLOR_GREEN = "#167450"
+COLOR_RED = "#B42332"
+COLOR_ORANGE = "#986000"
+TEXT_MUTED = "#536979"
+CARD_BG = "#FFFFFF"
+SUBTLE_BG = "#EAF0F4"
+
+
+# Formatiert Zahlen mit deutschem Dezimalkomma, ohne ihre Werte zu ändern.
+def number_de(value: float, digits: int = 2) -> str:
+    """Deutsches Dezimalformat ohne globale Locale-Änderung."""
+    return f"{value:.{digits}f}".replace(".", ",")
+
+
+# Erstellt die Oberfläche und verarbeitet Benutzereingaben sowie Worker-Meldungen.
+class LuftsteuerungApp(ctk.CTk):
+    """Tk-Hauptthread zeichnet ausschließlich und verarbeitet Bedienaktionen."""
+
+    # Richtet das Fenster ein, baut die Oberfläche auf und startet den Worker.
+    def __init__(self, *, simulate: bool = True, controller=None) -> None:
+        # Auch bei programmatischem Aufruf darf ein echter Controller niemals
+        # unter einer irreführenden Simulationsanzeige betrieben werden.
+        if simulate and controller is not None and not isinstance(controller, SimulatedDaqController):
+            raise ValueError("Simulationsmodus benötigt einen SimulatedDaqController.")
+        ctk.set_appearance_mode("light")
+        ctk.set_default_color_theme("blue")
+        super().__init__()
+        # Tk 9 stellt CTks Formen-Schrift je nach X11-System unvollständig dar.
+        # Polygonformen vermeiden dort defekte Ecken; Tk 8.6 behält den Standard.
+        if float(self.tk.call("info", "tclversion")) >= 9:
+            ctk.DrawEngine.preferred_drawing_method = "polygon_shapes"
+        self.simulate = simulate
+        self.title("Nassheuer | Luftsteuerung" + (" | Simulation" if simulate else " | Hardware") + " | Korrektur 2")
+        # Logische CTk-Maße: die bestehende DPI-Skalierung bleibt zuständig.
+        self.geometry("800x420")
+        self.minsize(800, 420)
+
+        # Unter Windows beim ersten Anzeigen einmalig maximieren.
+        if self.tk.call("tk", "windowingsystem") == "win32":
+            self._maximize_pending = True
+
+            def maximize_after_first_map(event):
+                if event.widget is not self or not self._maximize_pending:
+                    return
+                self._maximize_pending = False
+                self.after_idle(
+                    lambda: self.state("zoomed")
+                    if not (self.closing or self.shutdown_blocked) else None
+                )
+
+            self.bind("<Map>", maximize_after_first_map, add="+")
+        self.configure(fg_color="#F2F5F7")
+        # Getrennte Zustände statt eines mehrdeutigen „läuft“-Flags:
+        # closing: aktueller Abschlussversuch; shutdown_blocked: kein Wiederanlauf.
+        self.closing = False
+        self.shutdown_blocked = False
+        self.confirming = False
+        self.output_busy = False
+        self.measurement_valid = False
+        self.measurement_error = False
+        self.sensor_readings = {name: SensorReading() for name in SENSOR_CHANNELS}
+        self.last_measurement_at = 0.0
+        self.last_currents = None
+        self.measurement_message = "Initialisierung läuft · keine Messwerte"
+        # Unbestätigter Startzustand; echte Ressourceninformationen kommen erst per Ereignis.
+        self.daq_state = DaqState(False, (), False, False)
+        self.poll_after_id = None
+        self.shutdown_started_at = 0.0
+        self.worker = DaqWorker(controller if controller is not None else (
+            SimulatedDaqController() if simulate else DaqController()))
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+        self._build_gui()
+
+        # Gemeinsame, gut lesbare Buttonschrift und einheitliche Bedienhöhe.
+        button_font = ctk.CTkFont(family="Segoe UI", size=12, weight="bold")
+        for button in (self.output_button, self.clear_button, self.close_button):
+            button.configure(font=button_font, height=40)
+        self.clear_button.configure(text_color_disabled=TEXT_MUTED)
+        self.close_button.configure(text_color_disabled="#B7C8D7")
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self._log("Simulation: Startwerte 4 mA werden simuliert." if simulate else
+                    "Hardwaremodus: FU, GLF und GHF werden beim Start auf 4 mA initialisiert.")
+        self._log(f"Aktive Programmdatei: {__file__}")
+        # Erst nach Widgetaufbau darf der Thread Ereignisse liefern.
+        self.worker.start()
+        # 50-ms-Tk-Poller und ca. 200-ms-Messpakete besitzen absichtlich getrennte Takte.
+        self.poll_after_id = self.after(50, self.update_measurement)
+    # Nur geänderte Darstellungsoptionen an Tk übertragen.
+    def _configure_if_changed(self, widget, **options) -> None:
+        changed = {
+            key: value for key, value in options.items()
+            if widget.cget(key) != value
+        }
+        if changed:
+            widget.configure(**changed)
+
+    # Erstellt einheitlich formatierte Beschriftungen.
+    def _label(self, parent, text, *, size=13, bold=False, color=COLOR_DARK, **kwargs):
+        return ctk.CTkLabel(parent, text=text, text_color=color,
+                            font=ctk.CTkFont(family="Segoe UI", size=size, weight="bold" if bold else "normal"),
+                            **kwargs)
+
+    # Erstellt Kopfbereich, Reiter und den Schließen-Button.
+    def _build_gui(self) -> None:
+        # Kompakter Kopfbereich; Schließen bleibt auch ohne Scrollen erreichbar.
+        header = ctk.CTkFrame(self, fg_color=CARD_BG, corner_radius=0)
+        header.grid(row=0, column=0, sticky="ew")
+        header.grid_columnconfigure(0, weight=1)
+        self._label(
+            header, "NASSHEUER / LUFTSTEUERUNG",
+            size=18, bold=True, height=28,
+        ).grid(row=0, column=0, sticky="w", padx=12, pady=(6, 0))
+        mode = "SIMULATION · OHNE NI-ZUGRIFF" if self.simulate else "HARDWARE · MANUELL"
+        self._label(
+            header, mode, size=10, bold=True, height=28, width=190,
+            color=COLOR_BLUE, fg_color="#E1F0F4", corner_radius=6,
+        ).grid(row=0, column=1, padx=8, pady=(6, 0))
+        self.close_button = ctk.CTkButton(
+            header, text="Programm schließen", width=150,
+            fg_color=COLOR_DARK, command=self.on_close,
+        )
+        self.close_button.grid(row=0, column=2, padx=(0, 12), pady=(6, 0))
+        self.connection_label = self._label(
+            header, "Messsignale: Initialisierung",
+            size=10, height=18, color=COLOR_ORANGE, anchor="w",
+        )
+        self.connection_label.grid(
+            row=1, column=0, columnspan=3, sticky="ew", padx=12, pady=(0, 4),
+        )
+
+        self.tabs = ctk.CTkTabview(
+            self, fg_color="#F2F5F7", corner_radius=6,
+            segmented_button_selected_color=COLOR_BLUE,
+        )
+        self.tabs.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 6))
+        for name in ("Steuerung", "Einstellungen", "Regelung", "Diagnose"):
+            self.tabs.add(name)
+        self._build_control_tab(self.tabs.tab("Steuerung"))
+        self._build_settings_tab(self.tabs.tab("Einstellungen"))
+        self._build_regulation_tab(self.tabs.tab("Regelung"))
+        self.tabs.set("Steuerung")
+
+    # Erstellt Eingabekarten, Messwertanzeige, Status und Ereignisprotokoll.
+    def _build_control_tab(self, tab) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        # Die Bedienansicht hat bewusst keinen Scrollbereich.
+        content = ctk.CTkFrame(tab, fg_color="transparent")
+        content.grid(row=0, column=0, sticky="nsew")
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_rowconfigure(0, weight=1)
+
+        self.measurement_cards = {}
+        self.value_labels, self.current_labels, self.quality_labels = {}, {}, {}
+        self._flow_font = ctk.CTkFont(family="Segoe UI", size=32, weight="bold")
+        self.measurement_panel = ctk.CTkFrame(content, fg_color="transparent")
+        self.measurement_panel.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+        self.measurement_panel.grid_columnconfigure((0, 1), weight=1, uniform="sensors")
+        self.measurement_panel.grid_rowconfigure(0, weight=1)
+        self._measurement_card(self.measurement_panel, 0, "GHF", "High Flow", AI_GHF)
+        self._measurement_card(self.measurement_panel, 1, "GLF", "Low Flow", AI_GLF)
+
+        self.inputs, self.command_labels, self.entry_variables = {}, {}, {}
+        self.actuator_cards = {}
+        self.actuator_panel = ctk.CTkFrame(content, fg_color="transparent")
+        self.actuator_panel.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        self.actuator_panel.grid_columnconfigure((0, 1, 2), weight=1, uniform="actuators")
+        for col, (name, subtitle) in enumerate((
+            ("FU", "Frequenzumrichter"),
+            ("GLF", "Gleitschieber Low Flow"),
+            ("GHF", "Gleitschieber High Flow"),
+        )):
+            self._actuator_card(self.actuator_panel, col, name, subtitle)
+
+        # Übernahme und Vorschau stehen fest unter den drei Eingabefeldern.
+        actions = ctk.CTkFrame(content, fg_color=SUBTLE_BG, corner_radius=6)
+        self.actions_panel = actions
+        actions.grid(row=2, column=0, sticky="ew", pady=(0, 2))
+        actions.grid_columnconfigure(0, weight=1)
+        self.preview_label = self._label(
+            actions, "FU-Stromvorschau: — mA", size=11, bold=True, height=18,
+        )
+        self.preview_label.grid(row=0, column=0, sticky="w", padx=8, pady=(4, 0))
+        self.preview_hint = self._label(
+            actions, "Rechnung ohne Ausgabe · 0–100 % · Leer = unverändert",
+            size=9, height=16, color=TEXT_MUTED,
+        )
+        self.preview_hint.grid(row=1, column=0, sticky="w", padx=8, pady=(0, 4))
+        self.clear_button = ctk.CTkButton(
+            actions, text="Eingaben leeren", width=130, height=40,
+            fg_color="#D7E3E9", text_color=COLOR_DARK,
+            hover_color="#C7D7DF", command=self._clear_inputs,
+        )
+        self.clear_button.grid(row=0, column=1, rowspan=2, padx=(8, 6), pady=4)
+        self.output_button = ctk.CTkButton(
+            actions, text="Simulation übernehmen" if self.simulate else "Stellbefehle senden …",
+            width=200, height=40, fg_color=COLOR_BLUE, hover_color="#0D5669",
+            state="disabled", command=self.output_update,
+        )
+        self.output_button.grid(row=0, column=2, rowspan=2, padx=(0, 8), pady=4)
+        self.output_status = self._label(
+            content, "Noch kein Stellbefehl gesendet", size=11, height=20,
+            color=TEXT_MUTED, anchor="w", justify="left", wraplength=620,
+        )
+        self.output_status.grid(row=3, column=0, sticky="ew", padx=4)
+
+        # Technische Details und das Protokoll bekommen einen eigenen Reiter.
+        diagnose = self.tabs.tab("Diagnose")
+        diagnose.grid_columnconfigure(0, weight=1)
+        diagnose.grid_rowconfigure(0, weight=1)
+        details = ctk.CTkScrollableFrame(diagnose, fg_color="transparent")
+        details.grid(row=0, column=0, sticky="nsew")
+        details.grid_columnconfigure(0, weight=1)
+        self._label(details, "DIAGNOSE UND PROTOKOLL", size=16, bold=True).grid(
+            row=0, column=0, sticky="w", padx=10, pady=(8, 4),
+        )
+        self.measurement_status = self._label(
+            details, self.measurement_message, color=COLOR_ORANGE,
+            anchor="w", justify="left", wraplength=620,
+        )
+        self.measurement_status.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
+        self.task_label = self._label(
+            details, "Tasks: noch nicht initialisiert",
+            anchor="w", justify="left", wraplength=620,
+        )
+        self.task_label.grid(row=2, column=0, sticky="ew", padx=10, pady=4)
+        self._label(
+            details,
+            "Task schließen ≠ Anlage abschalten. Keine sicherheitsgerichtete Steuerung.\n"
+            "DAQ-Write bestätigt den Befehl; Ausgangsströme werden nicht rückgemessen.",
+            color=TEXT_MUTED, anchor="w", justify="left", wraplength=620,
+        ).grid(row=3, column=0, sticky="ew", padx=10, pady=8)
+        self.log_box = ctk.CTkTextbox(
+            details, height=220, fg_color=CARD_BG, text_color=COLOR_DARK,
+            font=ctk.CTkFont(family="Consolas", size=12),
+        )
+        self.log_box.grid(row=4, column=0, sticky="ew", padx=10, pady=(4, 10))
+        self.log_box.configure(state="disabled")
+
+        self.bind("<Configure>", self._update_card_layout, add="+")
+        self._update_card_layout()
+        self.log_box = ctk.CTkTextbox(content, height=105, fg_color=CARD_BG,
+                                      text_color=COLOR_DARK, font=ctk.CTkFont(family="Consolas", size=12))
+        self.log_box.grid(row=10, column=0, columnspan=3, sticky="ew", padx=6, pady=(0, 8))
+        self.log_box.configure(state="disabled")
+
+        # Nur Layoutänderungen auslösen; bestehende Tk-Bindungen erhalten.
+        self._cards_compact = None
+        self.bind("<Configure>", self._update_card_layout, add="+")
+        self._update_card_layout()
+
+    # Ordnet vorhandene Karten neu an, ohne Widgets oder Eingaben neu anzulegen.
+    # Kleine Fenster behalten dieselbe Anordnung; nur die große Zahl skaliert.
+    def _update_card_layout(self, event=None) -> None:
+        if event is not None and event.widget is not self:
+            return
+        if self.closing or self.shutdown_blocked:
+            return
+        # CTk liefert logische Größen; negative Monitorpositionen berücksichtigen.
+        dimensions = self.geometry().split("+", 1)[0].split("-", 1)[0]
+        height = int(dimensions.split("x", 1)[1])
+        font_size = 48 if height >= 650 else 32
+        if self._flow_font.cget("size") != font_size:
+            self._flow_font.configure(size=font_size)
+
+    # Erstellt das Eingabefeld und die Befehlsanzeige für einen Ausgang.
+    def _actuator_card(self, parent, column: int, name: str, subtitle: str) -> None:
+        card = ctk.CTkFrame(
+            parent, fg_color=CARD_BG, corner_radius=6,
+            border_width=1, border_color="#D7E3E9",
+        )
+        card.grid(row=0, column=column, sticky="nsew", padx=3)
+        card.grid_columnconfigure(0, weight=1)
+        self.actuator_cards[name] = card
+        available = name in CONFIGURED_ACTUATOR_CURVES
+        self._label(card, name, size=14, bold=True, height=18).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(4, 0),
+        )
+        curve = "0 % = 4 mA · 100 % = 20 mA" if name == "FU" else "0 % = 20 mA · 100 % = 4 mA"
+        self._label(
+            card, curve if available else "Kennlinie fehlt",
+            size=10, height=16, color=TEXT_MUTED if available else COLOR_ORANGE,
+        ).grid(row=1, column=0, sticky="w", padx=8)
+
+        row = ctk.CTkFrame(card, fg_color="transparent")
+        row.grid(row=2, column=0, sticky="ew", padx=8, pady=2)
+        row.grid_columnconfigure(1, weight=1)
+        self._label(row, "Sollwert", size=11, height=18).grid(
+            row=0, column=0, padx=(0, 5),
+        )
+        var = ctk.StringVar(master=self, value="")
+        self.entry_variables[name] = var
+        entry = ctk.CTkEntry(
+            row, width=70, height=30, textvariable=var,
+            fg_color="#F7F9FB", text_color=COLOR_DARK,
+            font=ctk.CTkFont(family="Segoe UI", size=16, weight="bold"),
+        )
+        entry.grid(row=0, column=1, sticky="ew")
+        self._label(row, "%", size=12, height=18).grid(row=0, column=2, padx=(5, 0))
+        if not available:
+            entry.configure(state="disabled")
+        self.inputs[name] = entry
+        if name == "FU":
+            self.fu_variable = var
+            var.trace_add("write", lambda *_: self._update_preview())
+        # Platz für die vorhandene dreizeilige Befehlsbestätigung reservieren.
+        label = self._label(
+            card, "Letzter Befehl: —", size=10, height=36,
+            color=TEXT_MUTED, anchor="w", justify="left", wraplength=205,
+        )
+        label.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 4))
+        self.command_labels[name] = label
+
+    def _measurement_card(self, parent, column, name, title, channel) -> None:
+        card = ctk.CTkFrame(
+            parent, fg_color=CARD_BG, corner_radius=6,
+            border_width=1, border_color="#D7E3E9",
+        )
+        card.grid(row=0, column=column, sticky="nsew", padx=3)
+        card.grid_columnconfigure(1, weight=1)
+        card.grid_rowconfigure(0, weight=1)
+        self.measurement_cards[name] = card
+        self._label(card, f"{name}\n{title}", size=11, bold=True, height=32).grid(
+            row=0, column=0, sticky="w", padx=(8, 4), pady=(4, 0),
+        )
+        value = ctk.CTkLabel(
+            card, text="—", font=self._flow_font,
+            text_color=COLOR_DARK, height=38,
+        )
+        value.grid(row=0, column=1, sticky="e", padx=4, pady=(4, 0))
+        self._label(card, "m³/h", size=11, height=18, color=TEXT_MUTED).grid(
+            row=0, column=2, sticky="e", padx=(0, 8),
+        )
+        current = self._label(
+            card, "Sensorstrom: — mA", size=10, height=16, color=TEXT_MUTED,
+        )
+        current.grid(row=1, column=0, columnspan=3, sticky="w", padx=8)
+        quality = self._label(
+            card, "Warte auf Messdaten", size=10, height=20, color=COLOR_ORANGE,
+            wraplength=320, anchor="w", justify="left",
+        )
+        quality.grid(row=2, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 4))
+        self.value_labels[name], self.current_labels[name], self.quality_labels[name] = value, current, quality
+
+    # Zeigt die konfigurierten Kanalnamen und Grenzwerte an. Keine Hardwareprüfung.
+    def _build_settings_tab(self, tab) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+        card = ctk.CTkScrollableFrame(tab, fg_color=CARD_BG)
+        card.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        self._label(card, "Hardware-Zuordnung", size=22, bold=True).pack(anchor="w", padx=20, pady=(20, 4))
+        self._label(card, "Aus beiden Quelldateien übernommen · physische Zuordnung noch zu prüfen",
+                    color=COLOR_ORANGE).pack(anchor="w", padx=20, pady=(0, 15))
+        for name, channel in [*AO_CHANNELS.items(), ("GHF-Sensor", AI_GHF), ("GLF-Sensor", AI_GLF)]:
+            row = ctk.CTkFrame(card, fg_color=SUBTLE_BG, corner_radius=5)
+            row.pack(fill="x", padx=20, pady=3)
+            self._label(row, name, bold=True, width=130, anchor="w").pack(side="left", padx=12, pady=7)
+            self._label(row, channel, color=TEXT_MUTED).pack(side="left", padx=10)
+        # Reine Informationsanzeige: keine Änderung an DAQ-Tasks oder Grenzwerten.
+        self._label(
+            card,
+            f"Messung: NI-9253 · {SAMPLE_RATE_HZ:.0f} Samples/s je Kanal angefordert\n"
+            "AI-Task: 3,5–20,0 mA im Code angefordert\n"
+            f"Sensor-Nullpunkt: {number_de(SENSOR_ZERO_A * 1000, 1)} mA\n"
+            f"Software-Plausibilitätsbereich: {number_de(SENSOR_VALID_MIN_A * 1000, 1)}–"
+            f"{number_de(SENSOR_VALID_MAX_A * 1000, 1)} mA\n"
+            f"Messzyklus: ca. {GUI_REFRESH_MS} ms zuzüglich Lesezeit · "
+            f"veraltet nach {number_de(MAX_MEASUREMENT_AGE_S, 1)} s\n\n"
+            f"AO-Task: {number_de(MIN_OUTPUT_A * 1000, 1)}–"
+            f"{number_de(MAX_OUTPUT_A * 1000, 1)} mA konfiguriert\n"
+            "FU: 0 % = 4 mA · 100 % = 20 mA\n"
+            "GLF/GHF: 0 % = 20 mA · 100 % = 4 mA\n\n"
+            "Im Hardwaremodus werden beim Start und beim bestätigten Schließen "
+            "jeweils 4 mA an FU, GLF und GHF angefordert.\n"
+            "DAQ-Write bestätigt den Befehl; der Ausgangsstrom wird nicht rückgemessen.",
+            justify="left", anchor="w", wraplength=620,
+            color=TEXT_MUTED,
+        ).pack(anchor="w", padx=20, pady=20)
+
+    # Zeigt an, dass noch kein automatischer Regler eingebaut ist.
+    def _build_regulation_tab(self, tab) -> None:
+        card = ctk.CTkFrame(tab, fg_color=CARD_BG)
+        card.pack(fill="both", expand=True, padx=8, pady=8)
+        self._label(card, "Regelung", size=22, bold=True).pack(anchor="w", padx=24, pady=(24, 8))
+        self._label(card, "Nicht implementiert", bold=True, color=COLOR_ORANGE).pack(anchor="w", padx=24)
+        self._label(card, "Die Quelldateien enthalten keinen automatischen Regler.\n"
+                    "Diese Version unterstützt manuelle Stellbefehle und die Durchflussanzeige.\n"
+                    "Simulierte Sensorwerte sind kein Modell der realen Luftstrecke.",
+                    justify="left", color=TEXT_MUTED, wraplength=620).pack(anchor="w", padx=24, pady=14)
+
+    # Schreibt Meldungen mit Uhrzeit in das sichtbare Ereignisprotokoll.
+    def _log(self, text: str) -> None:
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", f"[{datetime.now():%H:%M:%S}] {text}\n")
+        # Begrenztes Protokoll; kein unbegrenztes Wachstum im Dauerbetrieb.
+        if int(self.log_box.index("end-1c").split(".")[0]) > 300:
+            self.log_box.delete("1.0", "2.0")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    # Leert Eingabefelder. Bereits ausgegebene Sollströme bleiben unverändert.
+    def _clear_inputs(self) -> None:
+        if self.output_busy or self.confirming or self.closing:
+            return
+        for name, entry in self.inputs.items():
+            if name in CONFIGURED_ACTUATOR_CURVES:
+                entry.delete(0, "end")
+        self._update_preview()
+        self.output_status.configure(text="Eingaben geleert · Ausgänge unverändert", text_color=TEXT_MUTED)
+
+    # Zeigt den berechneten FU-Strom, ohne eine Ausgabe auszulösen.
+    def _update_preview(self, _event=None) -> None:
+        # Traces können vor der vollständigen Widget-Erstellung feuern.
+        if not hasattr(self, "preview_label"):
+            return
+        try:
+            percent = parse_percent(self.inputs["FU"].get(), "FU")
+            text = "— mA" if percent is None else number_de(fu_percent_to_amp(percent) * 1000, 3) + " mA"
+        except ValueError:
+            text = "Ungültige Eingabe"
+        self.preview_label.configure(text="FU-Stromvorschau: " + text)
+
+    # Prüft im GUI-Thread, ob der letzte gültige Messwert noch aktuell ist.
+    def _measurement_is_recent(self) -> bool:
+        now = time.monotonic()
+        # Nur die Ausgabefreigabe bleibt gemeinsam. Eine teilweise gültige
+        # Messung wird angezeigt, ersetzt aber nicht die bisherige Vorbedingung.
+        return (not self.measurement_error and all(
+            reading.valid and reading.recent(now) for reading in self.sensor_readings.values()))
+
+    # Aktiviert oder sperrt Eingaben und Buttons passend zum aktuellen Status.
+    def _refresh_controls(self) -> None:
+        editing = not (
+            self.closing or self.shutdown_blocked
+            or self.confirming or self.output_busy
+        )
+        # Sensorwarnungen und frühere Ausgabefehler sperren die manuelle
+        # Korrektur nicht. Werte und Kennlinien werden weiterhin validiert.
+        self._configure_if_changed(
+            self.output_button, state="normal" if editing else "disabled",
+            fg_color="#008C83" if editing else "#DCE5EB",
+            text_color="#FFFFFF", text_color_disabled=TEXT_MUTED,
+        )
+        self._configure_if_changed(
+            self.clear_button, state="normal" if editing else "disabled")
+
+        for name, entry in self.inputs.items():
+            self._configure_if_changed(
+                entry,
+                state="normal" if editing and name in CONFIGURED_ACTUATOR_CURVES
+                else "disabled",
+            )
+
+        if hasattr(self, "reconnect_button"):
+            self._configure_if_changed(
+                self.reconnect_button,
+                state="normal" if editing else "disabled",
+            )
+
+        self._configure_if_changed(
+            self.close_button,
+            state="disabled" if self.confirming or self.closing else "normal",
+        )
+
+    # Aktualisiert Messwerte und kennzeichnet ungültige oder veraltete Daten.
+    def _render_measurement(self) -> None:
+        now = time.monotonic()
+
+        if not hasattr(self, "_last_display_readings"):
+            self._last_display_readings = {}
+
+        self._display_times = {}
+        self._display_cached = {}
+        summaries = []
+        valid_count = 0
+
+        for name, convert in (
+            ("GHF", ghf_amp_to_m3h),
+            ("GLF", glf_amp_to_m3h),
+        ):
+            reading = self.sensor_readings[name]
+            finite = (
+                reading.current_a is not None
+                and math.isfinite(reading.current_a)
+            )
+
+            # Auch endliche Bereichsfehler mit Originalzeitstempel speichern.
+            # Ein Fehler wird dadurch nicht zu einem gültigen Messwert.
+            if finite and reading.received_at:
+                self._last_display_readings[name] = reading
+
+            shown = self._last_display_readings.get(name)
+            self._display_times[name] = shown.received_at if shown else 0.0
+
+            cached = shown is not None and (
+                shown is not reading
+                or not reading.recent(now)
+                or self.measurement_error
+                or self.closing
+                or self.shutdown_blocked
+            )
+            self._display_cached[name] = cached
+
+            # Endliche Sensorwerte immer umrechnen und anzeigen.
+            # Außerhalb der Kennlinie ist das nur ein ungeprüfter Rechenwert.
+            value_text = "—"
+            if shown is not None:
+                calculated = convert(shown.current_a)
+                if math.isfinite(calculated):
+                    value_text = number_de(calculated)
+
+            raw = reading.current_a
+            if raw is None and shown is not None:
+                raw = shown.current_a
+
+            if raw is None:
+                raw_text = "—"
+            elif math.isfinite(raw):
+                raw_text = number_de(
+                    raw * 1000, 3 if reading.valid else 6)
+            else:
+                raw_text = (
+                    "NaN" if math.isnan(raw)
+                    else "+∞" if raw > 0
+                    else "−∞"
+                )
+
+            color = COLOR_ORANGE
+
+            if self.closing or self.shutdown_blocked:
+                quality, summary = "Abschluss aktiv", "Abschluss"
+
+            elif self.measurement_error:
+                quality = "Messfehler · Erfassung beendet"
+                summary, color = "Messfehler", COLOR_RED
+
+            elif not reading.received_at:
+                quality, summary = "Warte auf neue Messdaten", "wartet"
+
+            elif not reading.recent(now):
+                quality, summary = "Keine aktuellen Messdaten", "veraltet"
+
+            elif reading.current_a is None:
+                quality = reading.problem or "Messwert fehlt"
+                summary, color = "fehlt", COLOR_RED
+
+            elif not reading.valid or value_text == "—":
+                quality = "Fehler: " + (
+                    reading.problem or "Messwert nicht berechenbar")
+                quality += " · Anzeige ist ein ungeprüfter Rechenwert"
+                summary, color = "Fehler", COLOR_RED
+
+            else:
+                quality = (
+                    "Simulierter Wert" if self.simulate
+                    else "Gültiges Stromsignal"
+                )
+                summary = "gültig"
+                color = COLOR_BLUE if self.simulate else COLOR_GREEN
+                valid_count += 1
+
+            if cached:
+                quality += " · Letzter empfangener Rechenwert"
+                if shown is not None and not shown.valid:
+                    quality += " · bereits beim Empfang ungültig"
+
+            self._configure_if_changed(
+                self.value_labels[name],
+                text=value_text,
+                text_color=COLOR_DARK if summary == "gültig" else color,
+            )
+            self._configure_if_changed(
+                self.current_labels[name],
+                text="Sensorstrom: " + raw_text + " mA",
+                text_color=color
+                if summary in ("Fehler", "Messfehler", "fehlt")
+                else TEXT_MUTED,
+            )
+            self._configure_if_changed(
+                self.quality_labels[name],
+                text=quality,
+                text_color=color,
+            )
+            summaries.append(f"{name}: {summary}")
+
+        summary_text = " · ".join(summaries)
+        summary_color = (
+            (COLOR_BLUE if self.simulate else COLOR_GREEN)
+            if valid_count == 2 else COLOR_ORANGE
+        )
+        if self.measurement_error:
+            summary_color = COLOR_RED
+
+        self._configure_if_changed(
+            self.measurement_status,
+            text=summary_text,
+            text_color=summary_color,
+        )
+        self._configure_if_changed(
+            self.connection_label,
+            text=("SIMULIERT · " if self.simulate else "") +
+                summary_text.upper(),
+            text_color=summary_color,
+        )
+
+        outputs = ", ".join(self.daq_state.output_tasks) or "keine"
+        self._configure_if_changed(
+            self.task_label,
+            text=("SIMULATION · " if self.simulate else "") +
+                f"Mess-Task: "
+                f"{'vorhanden' if self.daq_state.measurement_task else 'nicht vorhanden'}\n"
+                f"Ausgabe-Tasks: {outputs}\n"
+                f"Ausgabefehler: "
+                f"{'vorhanden · neuer Bedienversuch möglich' if self.daq_state.output_fault else 'keiner gemeldet'}",
+            text_color=COLOR_RED
+            if self.daq_state.output_fault else TEXT_MUTED,
+        )
+        self._refresh_controls()
+
+    # Zeigt nur bestätigte Befehle und leert deren Eingabefelder.
+    def _show_written(self, commands) -> None:
+        for name, percent, current in commands:
+            self.command_labels[name].configure(text=
+                f"{'Simulierter Befehl' if self.simulate else 'DAQ-Write bestätigt'}:\n"
+                f"{number_de(percent)} % / {number_de(current * 1000, 3)} mA\n"
+                "Kein gemessener Ausgangsstrom", text_color=COLOR_BLUE)
+            # Eingaben sind während des Auftrags gesperrt; nur erfolgreiche leeren.
+            self.inputs[name].configure(state="normal")
+            self.inputs[name].delete(0, "end")
+        self._update_preview()
+
+    # Liest Worker-Meldungen und plant mit after() den nächsten GUI-Durchlauf.
+    def update_measurement(self) -> None:
+        """GUI-Aktualisierung auch nach Darstellungsfehlern fortsetzen."""
+        previous = self.poll_after_id
+        self.poll_after_id = None
+
+        # Eine vorhandene Planung ersetzen, keinen zweiten Poller erzeugen.
+        if previous is not None:
+            try:
+                self.after_cancel(previous)
+            except tk.TclError:
+                pass
+
+        delay = 50
+        cycle_ok = True
+        try:
+            self._process_measurement_events()
+        except Exception:
+            import traceback
+            cycle_ok = False
+            delay = 500
+            self._report_gui_error(traceback.format_exc())
+        finally:
+            try:
+                alive = bool(self.winfo_exists())
+            except tk.TclError:
+                alive = False
+
+            if alive:
+                try:
+                    # Busy nicht zurücksetzen: Ein DAQ-Auftrag könnte noch laufen.
+                    self._refresh_controls()
+                except Exception:
+                    import traceback
+                    cycle_ok = False
+                    delay = 500
+                    self._report_gui_error(traceback.format_exc())
+                finally:
+                    if cycle_ok:
+                        self._last_gui_error = None
+                    self.poll_after_id = self.after(
+                        delay, self.update_measurement)
+
+    def _report_gui_error(self, detail: str) -> None:
+        # Gleiche Dauerfehler nicht ständig erneut in den Vordergrund holen.
+        if detail == getattr(self, "_last_gui_error", None):
+            return
+
+        self._last_gui_error = detail
+        print(detail)
+
+        try:
+            self._log("GUI-Fehler: " + detail.strip().splitlines()[-1])
+        except Exception:
+            pass
+
+        try:
+            self._show_error_details(
+                "Fehler in der Oberfläche",
+                detail + "\nDie Aktualisierung wird erneut versucht. "
+                "Ein laufender Hardwareauftrag wird dabei nicht abgebrochen.")
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    def _process_measurement_events(self) -> None:
+        """Verarbeitet Ereignisse; die Zeitplanung übernimmt update_measurement()."""
+        self.poll_after_id = None
+        # Queue-Rückstau darf die nächste Bedienaktion nicht unbegrenzt verzögern.
+        for _ in range(100):
+            try:
+                kind, payload = self.worker.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "state":
+                self.daq_state = payload
+            # Originalen Worker-Zeitstempel übernehmen statt durch „jetzt“ zu ersetzen.
+            elif kind == "measurement":
+                readings, self.last_measurement_at = payload
+                # Zustände enthalten unveränderliche Einzelwerte; keine Widgets
+                # oder lebenden Task-Referenzen kommen aus dem Worker-Thread.
+                previous = self.sensor_readings
+                self.sensor_readings = readings
+                self.last_currents = tuple(readings[name].current_a for name in SENSOR_CHANNELS)
+                self.measurement_valid = all(reading.valid for reading in readings.values())
+                self.measurement_error = False
+                # Nur einen geänderten Fehlerstatus protokollieren, nicht jeden
+                # identischen 200-ms-Messzyklus. Der betroffene Kanal ist benannt.
+                for name, reading in readings.items():
+                    if reading.problem and reading.problem != previous[name].problem:
+                        raw = ("fehlt" if reading.current_a is None else
+                               number_de(reading.current_a * 1000, 6) + " mA")
+                        self._log(f"{name} / {SENSOR_CHANNELS[name]}: {raw} · {reading.problem}")
+            elif kind == "measurement_restarting":
+                self.measurement_valid = False
+                self.measurement_error = False
+                self.last_measurement_at = 0.0
+                self.sensor_readings = {
+                    name: SensorReading() for name in SENSOR_CHANNELS
+                }
+                self.measurement_message = "Messung wird neu verbunden."
+
+            elif kind == "measurement_error":
+                self.measurement_valid = False
+                self.measurement_error = True
+                self.sensor_readings = {
+                    name: SensorReading(problem="DAQ-Messfehler")
+                    for name in SENSOR_CHANNELS
+                }
+                self.measurement_message = str(payload)
+                self._log(str(payload))
+                self._show_error_details(
+                    "Messung fehlgeschlagen",
+                    f"GHF: {AI_GHF}\nGLF: {AI_GLF}\n\n{payload}\n\n"
+                    "Messkanäle, Versorgung und Verbindung prüfen. Danach "
+                    "'Messung neu verbinden' drücken. Manuelle Stellbefehle "
+                    "bleiben nach Bestätigung möglich.",
+                )
+
+            elif kind == "measurement_restart_done":
+                self.output_busy = False
+                self.output_status.configure(
+                    text="Messneustart fehlgeschlagen · Details beachten"
+                    if self.measurement_error else
+                    "Messung gestartet · warte auf neue Messwerte",
+                    text_color=COLOR_RED if self.measurement_error else COLOR_BLUE,
+                )
+
+            elif kind == "started":
+                self.measurement_error = False
+                self._log("Mess-Task gestartet: GHF ai0 / GLF ai1, 1.000 Hz" +
+                          (" (simuliert)." if self.simulate else "."))
+            # Erst dieses Ereignis berechtigt zu einer sichtbaren Erfolgsbestätigung.
+            elif kind == "write_ok":
+                self.output_busy = False
+                self._show_written(payload)
+                self.output_status.configure(text=("Simulierter Befehl verarbeitet" if self.simulate
+                    else "DAQ-Write bestätigt · physikalischer Ausgangsstrom nicht gemessen"), text_color=COLOR_BLUE)
+                self._log(("Simulierter Befehl: " if self.simulate else "DAQ-Write: ") +
+                          ", ".join(f"{n} {number_de(p)} % / {number_de(a * 1000, 3)} mA" for n, p, a in payload))
+            # Teilbestätigung ehrlich darstellen, kein Gesamt-Erfolg und kein Rollback.
+            elif kind == "write_error":
+                self.output_busy = False
+                detail, successful = payload
+                self._show_written(successful)
+                self.output_status.configure(
+                    text="Ausgabefehler · Eingaben korrigieren und erneut senden",
+                    text_color=COLOR_RED,
+                )
+                confirmed = ", ".join(n for n, _, _ in successful) or "keine"
+                self._log("Ausgabefehler: " + detail + " | Bestätigt: " + confirmed)
+                self._show_error_details(
+                    "Stellbefehl fehlgeschlagen",
+                    f"{detail}\n\nBestätigte Teilbefehle: {confirmed}\n"
+                    "Der tatsächliche Ausgangszustand ist nicht gemessen.\n\n"
+                    "Kanaleinstellung/Verbindung prüfen, Sollwerte korrigieren "
+                    "und erneut senden. Frühere Teilaufträge werden nicht "
+                    "automatisch wiederholt.",
+                )
+            # Nur ohne gemeldete Schließfehler das Fenster endgültig zerstören.
+            elif kind == "closed":
+                if not payload:
+                    # Genau ein Tk-Interpreter gehört dieser Anwendung. Auch noch
+                    # wartende CTk-interne Zeichen-/Skalierungs-Callbacks abbrechen,
+                    for callback_id in self.tk.call("after", "info"):
+                        # Nur die Planung entfernen. Das jeweilige CTk-Kindwidget
+                        # löscht sein registriertes Python/Tcl-Kommando beim destroy.
+                        self.tk.call("after", "cancel", callback_id)
+                    self.destroy()
+                    return
+                self.closing = False
+                self.output_busy = False
+                self.output_status.configure(text="Schließfehler · nur erneutes Schließen zulässig", text_color=COLOR_RED)
+                self._log("Schließfehler: " + "; ".join(payload))
+                self.close_button.configure(text="Schließen erneut versuchen")
+        # Längeres Warten erklären, aber keinen noch aktiven Treiberaufruf gewaltsam beenden.
+        if self.closing and time.monotonic() - self.shutdown_started_at > 6:
+            self.output_status.configure(text="Warte auf DAQ-Treiber / Ressourcenfreigabe · noch nicht geschlossen",
+                                         text_color=COLOR_ORANGE)
+        # Auch ohne neue Nachricht müssen Messalter und Bedienbarkeit weiter geprüft werden.
+        self._render_measurement()
+        self._notify_sensor_errors()
+        # 50-ms-Tk-Poller und ca. 200-ms-Messpakete besitzen absichtlich getrennte Takte.
+        # Den nächsten Aufruf plant ausschließlich update_measurement().
+
+    # Prüft die Sollwerte, fragt nach Bestätigung und übergibt sie dem Worker.
+    def output_update(self) -> None:
+        if self.confirming or self.output_busy or self.closing or self.shutdown_blocked:
+            return
+        try:
+            commands = prepare_commands({
+                name: entry.get() for name, entry in self.inputs.items()
+            })
+            if not commands:
+                self.output_status.configure(
+                    text="Keine Sollwerte eingegeben", text_color=TEXT_MUTED)
+                return
+        except (ValueError, RuntimeError) as exc:
+            self.output_status.configure(text=str(exc), text_color=COLOR_RED)
+            self._log("Eingabe korrigieren: " + str(exc))
+            self._show_error_details("Eingabefehler", str(exc))
+            return
+
+        warnings = []
+        now = time.monotonic()
+        if self.measurement_error:
+            warnings.append("Messung: " + self.measurement_message)
+
+        # Warnungen anzeigen, ohne die manuelle Korrektur zu verriegeln.
+        for name, reading in self.sensor_readings.items():
+            if reading.valid and reading.recent(now) and not self.measurement_error:
+                continue
+            raw = "fehlt" if reading.current_a is None else (
+                number_de(reading.current_a * 1000, 6) + " mA")
+            age = "kein Empfang" if not reading.received_at else (
+                f"Alter {max(0, round((now - reading.received_at) * 1000))} ms")
+            reason = reading.problem or (
+                "Messwert veraltet" if not reading.recent(now)
+                else "keine gültige Sensorüberwachung")
+            warnings.append(
+                f"{name} / {SENSOR_CHANNELS[name]}: {raw}; {age}; {reason}")
+
+        if self.daq_state.output_fault:
+            warnings.append(
+                "Vorheriger Ausgangsfehler: Ausgangszustand nicht gemessen. "
+                "Ein betroffener Ausgangs-Task wird beim neuen Auftrag "
+                "zuerst freigegeben und neu vorbereitet.")
+
+        details = "\n".join(
+            f"{name}: {number_de(percent)} % → "
+            f"{number_de(current * 1000, 3)} mA"
+            for name, percent, current in commands)
+        warning_text = (
+            "\n\nAKTUELLE WARNUNGEN:\n" + "\n".join(warnings) +
+            "\n\nTrotz dieser Hinweise manuell senden?"
+            if warnings else ""
+        )
+
+        self.confirming = True
+        self._refresh_controls()
+        confirmed = False
+        try:
+            confirmed = messagebox.askyesno(
+                "Simulation bestätigen" if self.simulate else
+                "Manuelle Stromausgabe bestätigen",
+                ("Simulation, keine realen Ausgänge.\n\n" if self.simulate
+                 else "Folgende manuelle Stellbefehle senden?\n\n") +
+                details +
+                "\n\nSensorwarnungen verriegeln diesen manuellen Auftrag nicht." +
+                warning_text +
+                "\n\nDAQ-Bestätigung ist keine Messung des Ausgangsstroms.",
+                parent=self,
+            )
+        finally:
+            self.confirming = False
+            self._refresh_controls()
+
+        # Fehler während des Bestätigungsdialogs erst danach anzeigen.
+        pending = getattr(self, "_pending_error", None)
+        if pending is not None:
+            self._pending_error = None
+            self._show_error_details(*pending)
+
+        if not confirmed:
+            self.output_status.configure(
+                text="Befehl abgebrochen", text_color=TEXT_MUTED)
+        elif self.closing or self.shutdown_blocked or self.output_busy:
+            self.output_status.configure(
+                text="Auftrag nicht gesendet · anderer Vorgang aktiv",
+                text_color=COLOR_ORANGE)
+        else:
+            self.output_busy = self.worker.request_write(commands)
+            self.output_status.configure(
+                text="Stellbefehl angefordert · warte auf DAQ-Bestätigung"
+                if self.output_busy else "Auftrag nicht angenommen · erneut versuchen",
+                text_color=COLOR_ORANGE)
+        self._refresh_controls()
+
+    def _restart_measurement(self) -> None:
+        """Buttonaktion; der Worker übernimmt alle Treiberzugriffe."""
+        if self.confirming or self.output_busy or self.closing or self.shutdown_blocked:
+            return
+        self.output_busy = self.worker.request_restart_measurement()
+        self.output_status.configure(
+            text="Messung wird neu verbunden · Ausgänge werden nicht neu gesetzt"
+            if self.output_busy else "Messneustart nicht angenommen · erneut versuchen",
+            text_color=COLOR_ORANGE)
+        self._refresh_controls()
+
+    def _show_error_details(self, title: str, detail: str) -> None:
+        """Normaler Fehlerdialog mit OK, wie bei der Sollwertbestätigung."""
+        if self.closing:
+            return
+        if self.confirming:
+            # Keine Fehlerfenster über einen vorhandenen Dialog legen.
+            self._pending_error = (title, detail)
+            return
+
+        # Sehr lange Meldungen im Terminal vollständig erhalten.
+        text = detail
+        if len(text) > 1200:
+            print(title + "\n" + detail)
+            text = text[:500] + "\n…\n" + text[-500:]
+            text += "\n\nVollständige Meldung im Terminal."
+
+        self.confirming = True
+        try:
+            self._refresh_controls()
+            messagebox.showerror(
+                title,
+                text + "\n\nMit OK quittieren. Danach kannst du "
+                "Einstellungen ändern und erneut versuchen.",
+                parent=self,
+            )
+        finally:
+            # Nach OK die Bedienung wieder freigeben.
+            self.confirming = False
+            self._refresh_controls()
+
+        pending = getattr(self, "_pending_error", None)
+        if pending is not None:
+            self._pending_error = None
+            self._show_error_details(*pending)
+
+    def _notify_sensor_errors(self) -> None:
+        """Aktuelle Sensorfehler einmal melden, nicht bei jedem Messpaket."""
+        if (
+            self.confirming or self.closing
+            or self.shutdown_blocked or self.measurement_error
+        ):
+            return
+
+        if not hasattr(self, "_sensor_popup_problem"):
+            self._sensor_popup_problem = {}
+            self._sensor_popup_clear_since = {}
+            self._sensor_popup_last_seen = {}
+
+        now = time.monotonic()
+        alerts = []
+        new_error = False
+
+        for name, reading in self.sensor_readings.items():
+            old_time = self._sensor_popup_last_seen.get(name, 0.0)
+
+            # Eine Empfangspause unterbricht die fehlerfreie Beobachtungszeit.
+            if (
+                old_time
+                and reading.received_at - old_time > MAX_MEASUREMENT_AGE_S
+            ):
+                self._sensor_popup_clear_since.pop(name, None)
+
+            self._sensor_popup_last_seen[name] = reading.received_at
+
+            # Alte Zwischenwerte aus einer aufgestauten Queue nicht melden.
+            if not reading.recent(now):
+                self._sensor_popup_clear_since.pop(name, None)
+                continue
+
+            if reading.valid:
+                since = self._sensor_popup_clear_since.setdefault(name, now)
+
+                # Erst nach stabiler Erholung denselben Fehler erneut melden.
+                # Dadurch erzeugt Grenzpendeln keine ständigen Dialoge.
+                if now - since >= 3.0:
+                    self._sensor_popup_problem.pop(name, None)
+                continue
+
+            self._sensor_popup_clear_since.pop(name, None)
+
+            if reading.current_a is None:
+                # Ein leerer Startpuffer ist noch kein Bereichsfehler.
+                continue
+
+            problem = reading.problem or "Ungültiger Sensorstrom"
+            alerts.append(
+                f"{name}: {problem}\n"
+                f"Kanal: {SENSOR_CHANNELS[name]}\n"
+                f"Sensorstrom: "
+                f"{number_de(reading.current_a * 1000, 6)} mA"
+            )
+
+            # Nach Kanal und Fehlergrund unterscheiden, nicht nach jedem µA.
+            if self._sensor_popup_problem.get(name) != problem:
+                self._sensor_popup_problem[name] = problem
+                new_error = True
+
+        if new_error:
+            self._show_error_details(
+                "Sensorfehler",
+                "\n\n".join(alerts) +
+                "\n\nDer Istwert bleibt mit Fehlerhinweis sichtbar. "
+                "Manuelle Korrekturen bleiben möglich.",
+            )
+
+    # Fragt bei Bedarf nach der Anlagensicherung und fordert die Task-Freigabe an.
+    def on_close(self) -> None:
+        if self.closing or self.confirming:
+            return
+        self.confirming = True
+        self._refresh_controls()
+        try:
+            # Ausstehender Write kann vom Worker bereits übernommen worden sein.
+            if not self.simulate:
+                secured = messagebox.askyesno(
+                    "Mit 4-mA-Endwerten schließen?",
+                    "Beim Schließen werden folgende Sollwerte gesendet:\n\n"
+                    "FU: 0 % = 4 mA\n"
+                    "GLF: 100 % = 4 mA\n"
+                    "GHF: 100 % = 4 mA\n\n"
+                    "Endwerte senden und anschließend schließen?",
+                    parent=self,
+                )
+                if not secured:
+                    return
+        finally:
+            self.confirming = False
+            self._refresh_controls()
+        # Ab jetzt keine Wiederaufnahme, auch nicht nach einem Schließfehler.
+        self.closing = True
+        self.shutdown_blocked = True
+        self.shutdown_started_at = time.monotonic()
+        # Ressourcen ausschließlich durch ihren bisherigen Besitzerthread freigeben lassen.
+        self.worker.request_close()
+        self.output_status.configure(
+            text="4-mA-Endwerte werden gesendet; danach werden Tasks freigegeben",
+            text_color=COLOR_ORANGE,
+        )
+        self._refresh_controls()
+
+
+# Startet standardmäßig die Simulation. Echte Hardware erfordert --hardware.
+# Neue Oberfläche; vorhandene DAQ- und Bedienfunktionen bleiben die Basis.
+from collections import deque
+import tkinter as tk
+from tkinter import font as tkfont
+
+
+class LuftsteuerungDashboard(LuftsteuerungApp):
+    """Ansicht B mit drei Seiten, Messwertalter und zwei Verlaufskurven."""
+
+    def __init__(self, *, simulate=True, controller=None):
+        # Die Diagramme verwenden bereits empfangene Messpakete.
+        # Es werden dafür keine zusätzlichen Hardwareabfragen gestartet.
+        self._history = {
+            name: deque(maxlen=1200)
+            for name in ("GHF", "GLF")
+        }
+        self._recorded = {"GHF": 0.0, "GLF": 0.0}
+        self._plot_at = 0.0
+        self._graphs_dirty = True
+        self._density = None
+
+        # Die vorhandene Basisklasse übernimmt weiterhin:
+        # Worker, Hardwareinitialisierung, Bestätigungen und Programmabschluss.
+        super().__init__(simulate=simulate, controller=controller)
+        self._fit_dashboard(force=True)
+
+    def _text(self, parent, text, role="body", **kwargs):
+        """Erstellt eine Beschriftung mit einer gemeinsamen Schriftvorlage."""
+        return ctk.CTkLabel(
+            parent,
+            text=text,
+            font=self._fonts[role],
+            text_color=kwargs.pop("text_color", COLOR_DARK),
+            **kwargs,
+        )
+
+    def _panel(self, parent):
+        """Gemeinsames Aussehen der Messkarten und Bedienbereiche."""
+        return ctk.CTkFrame(
+            parent,
+            fg_color=CARD_BG,
+            corner_radius=8,
+            border_width=1,
+            border_color="#D7E3E9",
+        )
+
+    def _build_gui(self):
+        # Gemeinsame Schriftobjekte lassen sich beim Verkleinern des Fensters
+        # anpassen, ohne sämtliche Widgets neu aufzubauen.
+        self._fonts = {
+            "title": ctk.CTkFont(
+                family="Segoe UI", size=18, weight="bold"
+            ),
+            "heading": ctk.CTkFont(
+                family="Segoe UI", size=14, weight="bold"
+            ),
+            "value": ctk.CTkFont(
+                family="Segoe UI", size=28, weight="bold"
+            ),
+            "body": ctk.CTkFont(
+                family="Segoe UI", size=11
+            ),
+            "small": ctk.CTkFont(
+                family="Segoe UI", size=10
+            ),
+            "entry": ctk.CTkFont(
+                family="Segoe UI", size=16, weight="bold"
+            ),
+            "button": ctk.CTkFont(
+                family="Segoe UI", size=12, weight="bold"
+            ),
+            "unit": ctk.CTkFont(
+                family="Segoe UI", size=24, weight="bold"
+            ),
+            "strong": ctk.CTkFont(
+                family="Segoe UI", size=12, weight="bold"
+            ),
+            "channel": ctk.CTkFont(
+                family="Segoe UI", size=18, weight="bold"
+            ),
+            "command": ctk.CTkFont(
+                family="Segoe UI", size=14
+            ),
+            "table_header": ctk.CTkFont(
+                family="Segoe UI", size=11, weight="bold"
+            ),
+        }
+
+        # Negative Tk-Schriftgrößen bedeuten Pixel.
+        self._axis_font = tkfont.Font(
+            family="Segoe UI", size=-11
+        )
+        self._badge_font = tkfont.Font(
+            family="Segoe UI", size=-12, weight="bold"
+        )
+
+        self.configure(fg_color="#F6F9FD")
+
+        # Kopfzeile: Marke, Betriebsart und die drei gewünschten Seiten.
+        self.header = ctk.CTkFrame(
+            self,
+            fg_color=CARD_BG,
+            corner_radius=0,
+        )
+        self.header.grid(row=0, column=0, sticky="ew")
+        self.header.grid_columnconfigure(0, weight=1)
+
+        self._text(
+            self.header,
+            "NASSHEUER / LUFTSTEUERUNG",
+            "title",
+            height=28,
+        ).grid(
+            row=0, column=0, sticky="w", padx=12, pady=6
+        )
+
+        self._text(
+            self.header,
+            "SIMULATION" if self.simulate else "HARDWARE",
+            "button",
+            height=28,
+            width=100,
+            corner_radius=6,
+            fg_color="#DFF0F7",
+            text_color=COLOR_BLUE,
+        ).grid(
+            row=0, column=1, padx=8, pady=6
+        )
+
+        self.nav = ctk.CTkFrame(
+            self.header,
+            fg_color="transparent",
+        )
+        self.nav.grid(row=0, column=2, padx=8, pady=4)
+
+        self.pages = {}
+        self.nav_buttons = {}
+
+        for index, name in enumerate(
+            ("Steuerung", "Regelung", "Einstellungen")
+        ):
+            page = ctk.CTkFrame(
+                self,
+                fg_color="transparent",
+            )
+            self.pages[name] = page
+
+            button = ctk.CTkButton(
+                self.nav,
+                text=name,
+                width=90,
+                height=30,
+                font=self._fonts["button"],
+                corner_radius=6,
+                command=lambda selected=name: self._show_page(selected),
+            )
+            button.grid(row=0, column=index, padx=2)
+            self.nav_buttons[name] = button
+
+        # Diese Widgetverzeichnisse werden auch von den vorhandenen
+        # Bedien- und Messfunktionen der Basisklasse verwendet.
+        self.value_labels = {}
+        self.current_labels = {}
+        self.age_labels = {}
+        self.quality_labels = {}
+        self.command_labels = {}
+        self.inputs = {}
+        self.entry_variables = {}
+        self.graphs = {}
+
+        self._build_control_tab(self.pages["Steuerung"])
+        self._build_regulation_tab(self.pages["Regelung"])
+        self._build_settings_tab(self.pages["Einstellungen"])
+
+        # Untere Statuszeile mit dem vorhandenen Abschlussknopf.
+        footer = ctk.CTkFrame(
+            self,
+            fg_color="transparent",
+        )
+        footer.grid(
+            row=2, column=0, sticky="ew", padx=12, pady=(0, 6)
+        )
+        footer.grid_columnconfigure(0, weight=1)
+
+        self.connection_label = self._text(
+            footer,
+            "Initialisierung",
+            "small",
+            anchor="w",
+            height=18,
+        )
+        self.connection_label.grid(
+            row=0, column=0, sticky="w"
+        )
+
+        self.close_button = ctk.CTkButton(
+            footer,
+            text="Programm schließen",
+            width=150,
+            font=self._fonts["button"],
+            fg_color="#F9FBFE",
+            border_width=1,
+            border_color="#8799AD",
+            hover_color="#E4EDF6",
+            text_color=COLOR_DARK,
+            command=self.on_close,
+        )
+        self.reconnect_button = ctk.CTkButton(
+            footer, text="Messung neu verbinden", width=170, height=28,
+            font=self._fonts["button"], fg_color="#E1EDF4",
+            hover_color="#D5E5EE", text_color=COLOR_DARK,
+            command=self._restart_measurement,
+        )
+        self.reconnect_button.grid(row=0, column=1, padx=(8, 0))
+        self.close_button.grid(row=0, column=2, padx=(8, 0))
+
+        self.bind("<Configure>", self._fit_dashboard, add="+")
+        self._show_page("Steuerung")
+        self._fit_dashboard(force=True)
+
+    def _show_page(self, name):
+        """Wechselt die Ansicht, ohne den DAQ-Worker neu zu starten."""
+        for key, page in self.pages.items():
+            if key == name:
+                page.grid(
+                    row=1,
+                    column=0,
+                    sticky="nsew",
+                    padx=10,
+                    pady=4,
+                )
+            else:
+                page.grid_remove()
+
+            self.nav_buttons[key].configure(
+                fg_color="#E1EDF4" if key == name else "transparent",
+                hover_color="#D5E5EE",
+                text_color=COLOR_DARK,
+            )
+
+        self._graphs_dirty = True
+
+    def _build_control_tab(self, tab):
+        # Die gemeinsame uniform-Gruppe begrenzt das Verhältnis zwischen
+        # oberem Bedienbereich und den unteren Diagrammen.
+        self._control_page = tab
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(
+            0, weight=11, uniform="sections"
+        )
+        tab.grid_rowconfigure(
+            1, weight=9, uniform="sections"
+        )
+
+        upper = ctk.CTkFrame(
+            tab,
+            fg_color="transparent",
+        )
+        upper.grid(
+            row=0, column=0, sticky="nsew", pady=(0, 8)
+        )
+        upper.grid_columnconfigure(
+            0, weight=27, uniform="workspace"
+        )
+        upper.grid_columnconfigure(
+            1, weight=73, uniform="workspace"
+        )
+        upper.grid_rowconfigure(0, weight=1)
+
+        # Linke Spalte: zwei gleich große Messkarten.
+        readings = ctk.CTkFrame(
+            upper,
+            fg_color="transparent",
+        )
+        readings.grid(
+            row=0, column=0, sticky="nsew", padx=(0, 8)
+        )
+        readings.grid_columnconfigure(0, weight=1)
+        readings.grid_rowconfigure(
+            (0, 1), weight=1, uniform="readings"
+        )
+
+        for row, name in enumerate(("GHF", "GLF")):
+            card = self._panel(readings)
+            card.configure(fg_color="#EDF4FA")
+            card.grid(
+                row=row,
+                column=0,
+                sticky="nsew",
+                pady=(0, 4) if row == 0 else (4, 0),
+            )
+            card.grid_columnconfigure(0, weight=1)
+
+            # Zusätzlicher Platz bleibt unterhalb des zusammengehörenden
+            # Inhalts. Zahl und Einheit werden nicht auseinandergezogen.
+            card.grid_rowconfigure(4, weight=1)
+
+            self._text(
+                card,
+                f"{name} – Volumenstrom",
+                "heading",
+                height=20,
+            ).grid(
+                row=0,
+                column=0,
+                sticky="w",
+                padx=10,
+                pady=(4, 0),
+            )
+
+            number_row = ctk.CTkFrame(
+                card,
+                fg_color="transparent",
+            )
+            number_row.grid(
+                row=1,
+                column=0,
+                sticky="w",
+                padx=12,
+                pady=(0, 2),
+            )
+
+            value = self._text(
+                number_row,
+                "—",
+                "value",
+                height=26,
+            )
+            value.grid(row=0, column=0, sticky="w")
+            self.value_labels[name] = value
+
+            # Die Einheit steht unmittelbar neben dem Messwert.
+            self._text(
+                number_row,
+                "m³/h",
+                "unit",
+                height=24,
+            ).grid(
+                row=0,
+                column=1,
+                sticky="s",
+                padx=(5, 0),
+            )
+
+            details = ctk.CTkFrame(
+                card,
+                fg_color="transparent",
+            )
+            details.grid(
+                row=2, column=0, sticky="w", padx=12
+            )
+
+            self._text(
+                details,
+                "Sensorstrom:",
+                "body",
+                height=18,
+            ).grid(
+                row=0,
+                column=0,
+                sticky="w",
+                padx=(0, 8),
+            )
+
+            current = self._text(
+                details,
+                "— mA",
+                "strong",
+                height=18,
+            )
+            current.grid(row=0, column=1, sticky="w")
+            self.current_labels[name] = current
+
+            age_row = ctk.CTkFrame(
+                card,
+                fg_color="transparent",
+            )
+            age_row.grid(
+                row=3,
+                column=0,
+                sticky="w",
+                padx=12,
+                pady=(1, 4),
+            )
+
+            self._text(
+                age_row,
+                "Messwertalter:",
+                "body",
+                height=18,
+            ).grid(
+                row=0,
+                column=0,
+                sticky="w",
+                padx=(0, 8),
+            )
+
+            age = self._text(
+                age_row,
+                "—",
+                "strong",
+                height=20,
+                corner_radius=5,
+                fg_color="#CEE7FB",
+            )
+            age.grid(
+                row=0, column=1, sticky="w", ipadx=6
+            )
+            self.age_labels[name] = age
+
+        # Rechte Spalte: zusammenhängende Tabelle statt drei großer Karten.
+        panel = self._panel(upper)
+        panel.grid(row=0, column=1, sticky="nsew")
+        panel.grid_columnconfigure(0, weight=1)
+        panel.grid_rowconfigure(1, weight=1)
+
+        self._text(
+            panel,
+            "Manuelle Stellbefehle",
+            "heading",
+            height=20,
+        ).grid(
+            row=0,
+            column=0,
+            sticky="w",
+            padx=12,
+            pady=(4, 2),
+        )
+
+        table = ctk.CTkFrame(
+            panel,
+            fg_color="#D4DFEA",
+            corner_radius=6,
+            border_width=1,
+            border_color="#BDCCDC",
+        )
+        table.grid(
+            row=1, column=0, sticky="new", padx=10
+        )
+        table.grid_columnconfigure(0, weight=1)
+        self._command_table = table
+
+        self._spin_buttons = {}
+        self._spin_frames = {}
+        self._table_rows = []
+
+        # Zeile 0 enthält die Spaltenüberschriften.
+        # Zeilen 1–3 enthalten FU, GLF und GHF.
+        for row in range(4):
+            band = ctk.CTkFrame(
+                table,
+                corner_radius=0,
+                fg_color=(
+                    "#DCE6EF" if row == 0 else
+                    "#F5F8FC" if row % 2 else
+                    "#EDF3F9"
+                ),
+            )
+            band.grid(
+                row=row,
+                column=0,
+                sticky="nsew",
+                padx=1,
+                pady=(1, 0) if row < 3 else (1, 1),
+            )
+            band.grid_rowconfigure(0, weight=1)
+
+            # Identische Spaltenproportionen in Kopf- und Datenzeilen.
+            for col, weight in enumerate((22, 40, 38)):
+                band.grid_columnconfigure(
+                    col,
+                    weight=weight,
+                    uniform="columns",
+                )
+
+            if row == 0:
+                for col, title in enumerate((
+                    "Kanal",
+                    "Sollwert [%]",
+                    "Letzter bestätigter Befehl",
+                )):
+                    self._text(
+                        band,
+                        title,
+                        "table_header",
+                        height=18,
+                    ).grid(
+                        row=0,
+                        column=col,
+                        sticky="w",
+                        padx=10,
+                    )
+                continue
+
+            name = ("FU", "GLF", "GHF")[row - 1]
+            self._table_rows.append(band)
+
+            self._text(
+                band,
+                name,
+                "channel",
+                height=20,
+            ).grid(
+                row=0,
+                column=0,
+                sticky="w",
+                padx=10,
+                pady=1,
+            )
+
+            field = ctk.CTkFrame(
+                band,
+                fg_color="transparent",
+            )
+            field.grid(
+                row=0,
+                column=1,
+                sticky="w",
+                padx=10,
+                pady=1,
+            )
+
+            # Ein leeres Feld bedeutet weiterhin:
+            # Diesen Kanal beim Übernehmen unverändert lassen.
+            variable = ctk.StringVar(
+                master=self,
+                value="",
+            )
+            self.entry_variables[name] = variable
+
+            # Feste Eingabebreite: Das Zahlenfeld wird nicht mehr
+            # über die gesamte verfügbare Tabellenspalte gestreckt.
+            spin = ctk.CTkFrame(
+                field,
+                width=132,
+                height=30,
+                corner_radius=5,
+                fg_color="#FBFCFE",
+                border_width=1,
+                border_color="#8D9DB0",
+            )
+            spin.grid(row=0, column=0, sticky="w")
+            spin.grid_propagate(False)
+            spin.grid_columnconfigure(0, weight=1)
+            spin.grid_rowconfigure((0, 1), weight=1)
+
+            # self.inputs enthält weiterhin echte CTkEntry-Widgets,
+            # damit die vorhandenen Bedienfunktionen weiterarbeiten.
+            entry = ctk.CTkEntry(
+                spin,
+                width=100,
+                height=28,
+                textvariable=variable,
+                font=self._fonts["entry"],
+                border_width=0,
+                fg_color="#FBFCFE",
+                text_color=COLOR_DARK,
+                corner_radius=4,
+            )
+            entry.grid(
+                row=0,
+                column=0,
+                rowspan=2,
+                sticky="ew",
+                padx=(3, 0),
+            )
+
+            self.inputs[name] = entry
+            self._spin_frames[name] = spin
+
+            buttons = []
+
+            # Beide Pfeile ändern ausschließlich den Eingabetext.
+            # Sie lösen selbst keinen Schreibvorgang aus.
+            for arrow_row, (symbol, step) in enumerate(
+                (("▴", 1), ("▾", -1))
+            ):
+                button = ctk.CTkButton(
+                    spin,
+                    text=symbol,
+                    width=20,
+                    height=12,
+                    corner_radius=2,
+                    border_width=0,
+                    font=self._fonts["small"],
+                    fg_color="#E7EEF5",
+                    hover_color="#D2E1ED",
+                    text_color=COLOR_DARK,
+                    command=lambda channel=name, delta=step:
+                        self._step_setpoint(channel, delta),
+                )
+                button.grid(
+                    row=arrow_row,
+                    column=1,
+                    sticky="nsew",
+                    padx=(1, 2),
+                    pady=(2, 0) if arrow_row == 0 else (0, 2),
+                )
+                buttons.append(button)
+
+            self._spin_buttons[name] = buttons
+
+            self._text(
+                field,
+                "%",
+                "entry",
+                height=26,
+            ).grid(
+                row=0,
+                column=1,
+                sticky="w",
+                padx=(8, 0),
+            )
+
+            command_label = self._text(
+                band,
+                "—",
+                "command",
+                height=20,
+            )
+            command_label.grid(
+                row=0,
+                column=2,
+                sticky="w",
+                padx=10,
+            )
+            self.command_labels[name] = command_label
+
+        self.fu_variable = self.entry_variables["FU"]
+        self.fu_variable.trace_add(
+            "write",
+            lambda *_: self._update_preview(),
+        )
+
+        self._text(
+            panel,
+            "Befehlswerte · keine Ausgangsrückmessung",
+            "small",
+            height=12,
+        ).grid(
+            row=2,
+            column=0,
+            sticky="w",
+            padx=12,
+            pady=(2, 0),
+        )
+
+        actions = ctk.CTkFrame(
+            panel,
+            fg_color="transparent",
+        )
+        actions.grid(
+            row=3,
+            column=0,
+            sticky="ew",
+            padx=10,
+            pady=2,
+        )
+        actions.grid_columnconfigure(
+            (0, 1),
+            weight=1,
+            uniform="actions",
+        )
+
+        self.output_button = ctk.CTkButton(
+            actions,
+            text="▶  Sollwerte übernehmen",
+            height=30,
+            font=self._fonts["button"],
+            fg_color="#008C83",
+            hover_color="#00766E",
+            state="disabled",
+            command=self.output_update,
+        )
+        self.output_button.grid(
+            row=0,
+            column=0,
+            sticky="ew",
+            padx=(0, 4),
+        )
+
+        self.clear_button = ctk.CTkButton(
+            actions,
+            text="Eingaben leeren",
+            height=30,
+            font=self._fonts["button"],
+            fg_color="#F9FBFE",
+            border_width=1,
+            border_color="#8799AD",
+            hover_color="#E4EDF6",
+            text_color=COLOR_DARK,
+            command=self._clear_inputs,
+        )
+        self.clear_button.grid(
+            row=0,
+            column=1,
+            sticky="ew",
+            padx=(4, 0),
+        )
+
+        # Bestätigungen und Fehlermeldungen bleiben auf der Hauptseite.
+        self.output_status = self._text(
+            panel,
+            "Noch kein Stellbefehl gesendet",
+            "small",
+            height=12,
+            anchor="w",
+            wraplength=470,
+        )
+        self.output_status.grid(
+            row=4,
+            column=0,
+            sticky="ew",
+            padx=12,
+            pady=(0, 2),
+        )
+
+        # Unterer Bereich: zwei gleich große Diagramme.
+        plots = self._panel(tab)
+        plots.grid(row=1, column=0, sticky="nsew")
+        plots.grid_columnconfigure(
+            (0, 1),
+            weight=1,
+            uniform="plots",
+        )
+        plots.grid_rowconfigure(1, weight=1)
+
+        self._text(
+            plots,
+            "MESSWERTVERLÄUFE · " +
+            ("SIMULATION" if self.simulate else "HARDWARE"),
+            "table_header",
+            height=18,
+        ).grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            padx=10,
+            pady=(3, 0),
+        )
+
+        for column, name in enumerate(("GHF", "GLF")):
+            frame = self._panel(plots)
+            frame.grid(
+                row=1,
+                column=column,
+                sticky="nsew",
+                padx=(4, 3) if column == 0 else (3, 4),
+                pady=(0, 4),
+            )
+            frame.grid_columnconfigure(0, weight=1)
+            frame.grid_rowconfigure(1, weight=1)
+
+            self._text(
+                frame,
+                f"{name} · Durchflussverlauf",
+                "heading",
+                height=22,
+            ).grid(
+                row=0,
+                column=0,
+                sticky="w",
+                padx=10,
+                pady=(3, 0),
+            )
+
+            canvas = tk.Canvas(
+                frame,
+                background="#F6F9FD",
+                highlightthickness=0,
+                width=100,
+                height=40,
+            )
+            canvas.grid(
+                row=1,
+                column=0,
+                sticky="nsew",
+                padx=4,
+                pady=(0, 4),
+            )
+            canvas.bind(
+                "<Configure>",
+                self._mark_graphs_dirty,
+                add="+",
+            )
+            self.graphs[name] = canvas
+
+    def _step_setpoint(self, name, delta):
+        """Ändert den Sollwertentwurf um einen Prozentpunkt."""
+        entry = self.inputs[name]
+
+        # Gesperrte Eingaben dürfen auch über die Pfeile nicht geändert werden.
+        if entry.cget("state") == "disabled":
+            return
+
+        try:
+            current = parse_percent(entry.get(), name)
+        except ValueError:
+            # Fehlerhafte Texteingaben bleiben zur Korrektur erhalten.
+            return
+
+        value = max(
+            0.0,
+            min(
+                100.0,
+                (current if current is not None else 0.0) + delta,
+            ),
+        )
+
+        self.entry_variables[name].set(
+            number_de(value, 0 if value.is_integer() else 2)
+        )
+
+    def _refresh_controls(self):
+        # Die vorhandenen Messwert-, Fehler- und Abschlussprüfungen
+        # entscheiden weiterhin über die Bedienfreigabe.
+        super()._refresh_controls()
+
+        # Die zusätzlichen Pfeiltasten erhalten denselben Zustand
+        # wie das zugehörige Eingabefeld.
+        for name, buttons in self._spin_buttons.items():
+            state = self.inputs[name].cget("state")
+            for button in buttons:
+                self._configure_if_changed(
+                    button,
+                    state=state,
+                )
+
+        if self.output_button.cget("state") == "normal":
+            self._configure_if_changed(
+                self.output_button,
+                fg_color="#008C83",
+            )
+
+    def _configure_if_changed(self, widget, **options):
+        # Die Basisklasse liefert "Sensorstrom: ...".
+        # Die neue Karte besitzt dafür eine separate feste Beschriftung.
+        if widget in getattr(self, "current_labels", {}).values():
+            text = options.get("text")
+            if text is not None and text.startswith("Sensorstrom: "):
+                options["text"] = text.removeprefix("Sensorstrom: ")
+
+            if options.get("text_color") == TEXT_MUTED:
+                options["text_color"] = COLOR_DARK
+
+        super()._configure_if_changed(widget, **options)
+
+    def _build_settings_tab(self, tab):
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(0, weight=1)
+
+        # Nur die Informationsseite darf bei Bedarf scrollen.
+        body = ctk.CTkScrollableFrame(
+            tab,
+            fg_color=CARD_BG,
+        )
+        body.grid(row=0, column=0, sticky="nsew")
+
+        self._label(
+            body,
+            "Einstellungen und Systeminformationen",
+            size=20,
+            bold=True,
+        ).pack(
+            anchor="w",
+            padx=16,
+            pady=(12, 6),
+        )
+
+        for name, channel in [
+            *AO_CHANNELS.items(),
+            ("GHF-Sensor", AI_GHF),
+            ("GLF-Sensor", AI_GLF),
+        ]:
+            self._label(
+                body,
+                f"{name}: {channel}",
+                anchor="w",
+            ).pack(
+                fill="x",
+                padx=16,
+            )
+
+        self.preview_label = self._label(
+            body,
+            "FU-Stromvorschau: — mA",
+            anchor="w",
+        )
+        self.preview_label.pack(
+            fill="x",
+            padx=16,
+            pady=(6, 0),
+        )
+
+        self._label(
+            body,
+            f"Software-Plausibilität: "
+            f"{number_de(SENSOR_VALID_MIN_A * 1000, 1)}–"
+            f"{number_de(SENSOR_VALID_MAX_A * 1000, 1)} mA\n"
+            "FU: 0 % = 4 mA, 100 % = 20 mA\n"
+            "GLF/GHF: 0 % = 20 mA, 100 % = 4 mA\n"
+            "Messwertalter = Zeit seit Softwareempfang, "
+            "kein Hardware-Zeitstempel.\n"
+            "Verläufe enthalten angezeigte Messpakete, "
+            "keine zusätzlichen Abfragen.",
+            justify="left",
+            anchor="w",
+            wraplength=620,
+        ).pack(
+            fill="x",
+            padx=16,
+            pady=8,
+        )
+
+        # Ausführliche Sensorzustände bleiben hier verfügbar.
+        for name in ("GHF", "GLF"):
+            label = self._label(
+                body,
+                f"{name}: Warte auf Messdaten",
+                anchor="w",
+                wraplength=620,
+            )
+            label.pack(fill="x", padx=16)
+            self.quality_labels[name] = label
+
+        self.measurement_status = self._label(
+            body,
+            "Initialisierung",
+            anchor="w",
+            wraplength=620,
+        )
+        self.measurement_status.pack(fill="x", padx=16)
+
+        self.task_label = self._label(
+            body,
+            "Tasks: noch nicht initialisiert",
+            anchor="w",
+            justify="left",
+            wraplength=620,
+        )
+        self.task_label.pack(
+            fill="x",
+            padx=16,
+            pady=6,
+        )
+
+        self._label(
+            body,
+            "Ereignisprotokoll",
+            size=16,
+            bold=True,
+        ).pack(
+            anchor="w",
+            padx=16,
+            pady=(10, 4),
+        )
+
+        self.log_box = ctk.CTkTextbox(
+            body,
+            height=200,
+            fg_color="#F2F5F7",
+            text_color=COLOR_DARK,
+            font=ctk.CTkFont(
+                family="Consolas",
+                size=12,
+            ),
+        )
+        self.log_box.pack(
+            fill="x",
+            padx=16,
+            pady=(0, 12),
+        )
+        self.log_box.configure(state="disabled")
+
+    def _fit_dashboard(self, event=None, force=False):
+        """Passt Schriften und Bedienelemente an die Fenstergröße an."""
+        if event is not None and event.widget is not self:
+            return
+
+        if self.closing or self.shutdown_blocked:
+            return
+
+        dimensions = (
+            self.geometry()
+            .split("+", 1)[0]
+            .split("-", 1)[0]
+        )
+        width, height = map(int, dimensions.split("x", 1))
+        compact = height < 650 or width < 1100
+
+        if compact == self._density and not force:
+            return
+
+        self._density = compact
+
+        sizes = {
+            "title": 16 if compact else 19,
+            "heading": 13 if compact else 21,
+            "value": 24 if compact else 46,
+            "unit": 22 if compact else 40,
+            "body": 10 if compact else 15,
+            "strong": 11 if compact else 17,
+            "channel": 15 if compact else 24,
+            "entry": 16 if compact else 24,
+            "command": 12 if compact else 20,
+            "table_header": 10 if compact else 14,
+            "small": 9 if compact else 10,
+            "button": 11 if compact else 16,
+        }
+
+        for role, size in sizes.items():
+            self._fonts[role].configure(size=size)
+
+        self._axis_font.configure(
+            size=-10 if compact else -14
+        )
+        self._badge_font.configure(
+            size=-11 if compact else -16
+        )
+
+        # Im kompakten Fenster bleiben die Tabellenzeilen fest.
+        # Im großen Fenster füllen sie den begrenzten Tabellenbereich.
+        self._command_table.grid(
+            sticky="new" if compact else "nsew"
+        )
+
+        for row in (1, 2, 3):
+            self._command_table.grid_rowconfigure(
+                row,
+                weight=0 if compact else 1,
+                uniform="data" if not compact else "",
+            )
+
+        row_height = 26 if compact else 46
+        for band in self._table_rows:
+            band.grid_rowconfigure(
+                0,
+                minsize=row_height,
+            )
+
+        for name, entry in self.inputs.items():
+            entry.configure(
+                height=24 if compact else 34
+            )
+            self._spin_frames[name].configure(
+                width=110 if compact else 172,
+                height=26 if compact else 36,
+            )
+
+        for button in (
+            self.output_button,
+            self.clear_button,
+            self.close_button,
+            self.reconnect_button,
+        ):
+            button.configure(
+                height=26 if compact else 40,
+                font=self._fonts["button"],
+            )
+
+        for button in self.nav_buttons.values():
+            button.configure(
+                width=88 if compact else 104,
+                height=28,
+            )
+
+        # Bei kleinen Fenstern etwas mehr Höhe für die Bedienung reservieren.
+        self._control_page.grid_rowconfigure(
+            0,
+            weight=3 if compact else 11,
+        )
+        self._control_page.grid_rowconfigure(
+            1,
+            weight=2 if compact else 9,
+        )
+
+        self.output_status.configure(
+            wraplength=470 if compact else 760
+        )
+        self._graphs_dirty = True
+
+    def _show_written(self, commands):
+        commands = tuple(commands)
+
+        # Weiterhin nur tatsächlich bestätigte Teilbefehle übernehmen
+        # und deren Eingabefelder anschließend leeren.
+        super()._show_written(commands)
+
+        for name, percent, current in commands:
+            self.command_labels[name].configure(
+                text=number_de(current * 1000, 3) + " mA",
+                text_color=COLOR_DARK,
+            )
+
+    def _mark_graphs_dirty(self, _event=None):
+        self._graphs_dirty = True
+
+    def _render_measurement(self):
+        # Bestehende Einzelkanalbewertung und Ausgabefreigaben ausführen.
+        super()._render_measurement()
+
+        now = time.monotonic()
+
+        for name, convert in (
+            ("GHF", ghf_amp_to_m3h),
+            ("GLF", glf_amp_to_m3h),
+        ):
+            reading = self.sensor_readings[name]
+
+            # Das Alter gehört zum angezeigten Wert, nicht zu einer Fehlermeldung.
+            displayed_at = self._display_times.get(name, 0.0)
+            age = max(0, round((now - displayed_at) * 1000)) if displayed_at else None
+            cached = self._display_cached.get(name, False)
+            text = "—" if age is None else f"{age} ms"
+            color = COLOR_DARK
+
+            if self.measurement_error or (reading.received_at and not reading.valid):
+                color = COLOR_RED
+            elif cached or self.closing or self.shutdown_blocked:
+                color = COLOR_ORANGE
+
+            if cached:
+                text += " · ALT"
+            elif color == COLOR_RED:
+                text += " · FEHLER"
+
+            self._configure_if_changed(
+                self.age_labels[name], text=text, text_color=color)
+
+            # Pro neuem Softwareempfang höchstens einen Punkt speichern.
+            # Ein ungültiger Messwert erzeugt eine Lücke im Verlauf.
+            if (
+                reading.received_at
+                and reading.received_at != self._recorded[name]
+            ):
+                self._recorded[name] = reading.received_at
+
+                valid = (
+                    reading.valid
+                    and not self.measurement_error
+                    and reading.recent(now)
+                )
+                value = (
+                    convert(reading.current_a)
+                    if valid else None
+                )
+
+                self._history[name].append(
+                    (reading.received_at, value)
+                )
+
+            # Das Diagramm zeigt ausschließlich die letzten 60 Sekunden.
+            while (
+                self._history[name]
+                and self._history[name][0][0] < now - 60
+            ):
+                self._history[name].popleft()
+
+        # Den vorhandenen GUI-Poller verwenden.
+        # Kein zusätzlicher Thread und keine weitere after()-Schleife.
+        if (
+            self._graphs_dirty
+            or now - self._plot_at >= max(
+                0.2,
+                GUI_REFRESH_MS / 1000,
+            )
+        ):
+            self._graphs_dirty = False
+            self._plot_at = now
+
+            for name in ("GHF", "GLF"):
+                self._draw_graph(name, now)
+
+    def _draw_graph(self, name, now):
+        canvas = self.graphs[name]
+
+        if not canvas.winfo_ismapped():
+            return
+
+        width = canvas.winfo_width()
+        height = canvas.winfo_height()
+
+        if width < 60 or height < 20:
+            return
+
+        canvas.delete("all")
+
+        history = list(self._history[name])
+        valid_values = [
+            value
+            for _, value in history
+            if value is not None
+        ]
+
+        if not valid_values:
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text="Noch keine gültigen Messdaten",
+                fill=TEXT_MUTED,
+                font=self._axis_font,
+            )
+            return
+
+        # Jeder Kanal erhält eine eigene Skala.
+        # Vorhandene kalibrierte Werte werden nicht verändert oder geklemmt.
+        low = min(valid_values)
+        high = max(valid_values)
+        padding = max(1.0, (high - low) * 0.15)
+        low -= padding
+        high += padding
+
+        line_height = self._axis_font.metrics("linespace")
+        mini = height < line_height * 5
+
+        left = (
+            6 if mini
+            else self._axis_font.measure("-999,9") + 10
+        )
+        right = width - 10
+        top = 6 if mini else line_height + 4
+        bottom = height - (
+            6 if mini else line_height * 2 + 8
+        )
+
+        if bottom <= top or right <= left:
+            return
+
+        def point(timestamp, value):
+            x = left + (
+                (timestamp - (now - 60)) / 60
+                * (right - left)
+            )
+            y = bottom - (
+                (value - low) / (high - low)
+                * (bottom - top)
+            )
+            return x, y
+
+        if not mini:
+            # Horizontales Raster und Durchflussskala.
+            for index in range(4):
+                value = low + (high - low) * index / 3
+                y = point(now, value)[1]
+
+                canvas.create_line(
+                    left, y, right, y,
+                    fill="#DFE7EE",
+                )
+                canvas.create_text(
+                    left - 6,
+                    y,
+                    text=number_de(value, 1),
+                    anchor="e",
+                    font=self._axis_font,
+                    fill=TEXT_MUTED,
+                )
+
+            # Gemeinsame Zeitachse: -60 Sekunden bis jetzt.
+            for seconds in (-60, -45, -30, -15, 0):
+                x = left + (
+                    (seconds + 60) / 60
+                    * (right - left)
+                )
+
+                canvas.create_line(
+                    x, top, x, bottom,
+                    fill="#E8EDF2",
+                )
+                canvas.create_text(
+                    x,
+                    bottom + 3,
+                    text=str(seconds),
+                    anchor="n",
+                    font=self._axis_font,
+                    fill=TEXT_MUTED,
+                )
+
+            canvas.create_text(
+                left,
+                0,
+                text="m³/h",
+                anchor="nw",
+                font=self._axis_font,
+                fill=TEXT_MUTED,
+            )
+            canvas.create_text(
+                (left + right) / 2,
+                height - 1,
+                text="Zeit [s]",
+                anchor="s",
+                font=self._axis_font,
+                fill=TEXT_MUTED,
+            )
+
+        color = (
+            "#009688" if name == "GHF"
+            else "#176FD1"
+        )
+
+        segment = []
+        previous_time = None
+
+        def draw_segment():
+            if len(segment) >= 4:
+                canvas.create_line(
+                    *segment,
+                    fill=color,
+                    width=2,
+                    smooth=False,
+                )
+
+        # Fehlerhafte Messungen und längere Empfangspausen dürfen
+        # nicht durch eine scheinbar durchgängige Linie verbunden werden.
+        for timestamp, value in history:
+            gap = (
+                previous_time is not None
+                and timestamp - previous_time > MAX_MEASUREMENT_AGE_S
+            )
+
+            if value is None or gap:
+                draw_segment()
+                segment = []
+
+            if value is not None:
+                segment.extend(point(timestamp, value))
+
+            previous_time = timestamp
+
+        draw_segment()
+
+        reading = self.sensor_readings[name]
+
+        # Ein Live-Wertkästchen erscheint ausschließlich bei einem
+        # aktuell gültigen Kanal ohne Messfehler oder aktiven Abschluss.
+        live = (
+            not (
+                self.measurement_error
+                or self.closing
+                or self.shutdown_blocked
+            )
+            and reading.valid
+            and reading.recent(now)
+            and history
+            and history[-1][1] is not None
+            and now - history[-1][0] <= MAX_MEASUREMENT_AGE_S
+        )
+
+        if live:
+            x, y = point(*history[-1])
+
+            canvas.create_oval(
+                x - 3,
+                y - 3,
+                x + 3,
+                y + 3,
+                fill=color,
+                outline=CARD_BG,
+            )
+
+            # Tatsächlichen letzten Messwert anzeigen.
+            text = (
+                number_de(history[-1][1], 2)
+                + " m³/h"
+            )
+            badge_width = self._badge_font.measure(text) + 16
+            badge_height = (
+                self._badge_font.metrics("linespace") + 8
+            )
+
+            # Das Kästchen muss vollständig in den Canvas passen.
+            if (
+                badge_width < right - left
+                and badge_height < bottom - top
+            ):
+                bx = max(
+                    left,
+                    min(
+                        x - badge_width + 6,
+                        right - badge_width,
+                    ),
+                )
+                by = max(
+                    2,
+                    min(
+                        y - badge_height - 10,
+                        bottom - badge_height,
+                    ),
+                )
+
+                # Wenn oberhalb nicht genug Platz vorhanden ist,
+                # das Kästchen unterhalb des Punktes platzieren.
+                if by + badge_height > y - 5:
+                    by = min(
+                        bottom - badge_height,
+                        y + 10,
+                    )
+
+                canvas.create_rectangle(
+                    bx,
+                    by,
+                    bx + badge_width,
+                    by + badge_height,
+                    fill=(
+                        "#D9F5EE" if name == "GHF"
+                        else "#DEEDFF"
+                    ),
+                    outline=(
+                        "#8DDACC" if name == "GHF"
+                        else "#9DC5F7"
+                    ),
+                )
+                canvas.create_text(
+                    bx + badge_width / 2,
+                    by + badge_height / 2,
+                    text=text,
+                    font=self._badge_font,
+                    fill=COLOR_DARK,
+                )
+
+                
+def main():
+    parser = argparse.ArgumentParser(description="Nassheuer-Luftsteuerung")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--simulate", action="store_true", help="Simulation ohne NI-Zugriff")
+    group.add_argument("--hardware", action="store_true", help="Reale NI-Hardware verwenden")
+    args = parser.parse_args()
+    app = LuftsteuerungDashboard(simulate=not args.hardware)
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
